@@ -255,8 +255,34 @@ func (m tuiModel) renderQueueView() string {
 		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 68)))
 		b.WriteString("\n")
 
+		// Calculate visible job range based on terminal height
+		// Reserve lines for: title(2) + status(2) + header(2) + help(2) + scroll indicator(1)
+		reservedLines := 9
+		visibleJobs := m.height - reservedLines
+		if visibleJobs < 3 {
+			visibleJobs = 3 // Show at least 3 jobs
+		}
+
+		// Determine which jobs to show, keeping selected item visible
+		start := 0
+		end := len(m.jobs)
+
+		if len(m.jobs) > visibleJobs {
+			// Center the selected item when possible
+			start = m.selectedIdx - visibleJobs/2
+			if start < 0 {
+				start = 0
+			}
+			end = start + visibleJobs
+			if end > len(m.jobs) {
+				end = len(m.jobs)
+				start = end - visibleJobs
+			}
+		}
+
 		// Jobs
-		for i, job := range m.jobs {
+		for i := start; i < end; i++ {
+			job := m.jobs[i]
 			line := m.renderJobLine(job)
 			if i == m.selectedIdx {
 				line = tuiSelectedStyle.Render("> " + line)
@@ -264,6 +290,13 @@ func (m tuiModel) renderQueueView() string {
 				line = "  " + line
 			}
 			b.WriteString(line)
+			b.WriteString("\n")
+		}
+
+		// Show scroll indicator if not all jobs visible
+		if len(m.jobs) > visibleJobs {
+			scrollInfo := fmt.Sprintf("[showing %d-%d of %d]", start+1, end, len(m.jobs))
+			b.WriteString(tuiStatusStyle.Render(scrollInfo))
 			b.WriteString("\n")
 		}
 	}
