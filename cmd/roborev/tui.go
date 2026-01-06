@@ -197,6 +197,48 @@ func (m tuiModel) addressReview(reviewID int64, addressed bool) tea.Cmd {
 	}
 }
 
+func (m tuiModel) toggleAddressedForJob(jobID int64, currentState *bool) tea.Cmd {
+	return func() tea.Msg {
+		// Fetch the review to get its ID
+		resp, err := http.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return tuiErrMsg(fmt.Errorf("no review for this job"))
+		}
+
+		var review storage.Review
+		if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
+			return tuiErrMsg(err)
+		}
+
+		// Toggle the state
+		newState := true
+		if currentState != nil && *currentState {
+			newState = false
+		}
+
+		// Now mark it
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"review_id": review.ID,
+			"addressed": newState,
+		})
+		resp2, err := http.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		defer resp2.Body.Close()
+
+		if resp2.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("failed to mark review"))
+		}
+		return tuiAddressedMsg(newState)
+	}
+}
+
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -326,10 +368,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "a":
-			// Toggle addressed status for current review
+			// Toggle addressed status
 			if m.currentView == tuiViewReview && m.currentReview != nil && m.currentReview.ID > 0 {
 				newState := !m.currentReview.Addressed
 				return m, m.addressReview(m.currentReview.ID, newState)
+			} else if m.currentView == tuiViewQueue && len(m.jobs) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
+				job := m.jobs[m.selectedIdx]
+				if job.Status == storage.JobStatusDone && job.Addressed != nil {
+					return m, m.toggleAddressedForJob(job.ID, job.Addressed)
+				}
 			}
 
 		case "esc":
@@ -475,7 +522,7 @@ func (m tuiModel) renderQueueView() string {
 	}
 
 	// Help
-	b.WriteString(tuiHelpStyle.Render("up/down/pgup/pgdn: navigate | enter: review | p: prompt | q: quit"))
+	b.WriteString(tuiHelpStyle.Render("up/down/pgup/pgdn: navigate | enter: review | p: prompt | a: toggle addressed | q: quit"))
 
 	return b.String()
 }
