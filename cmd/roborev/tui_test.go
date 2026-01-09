@@ -2179,3 +2179,212 @@ func TestTUIEmptyRefreshSeedsFromCurrentReview(t *testing.T) {
 		t.Errorf("Expected selectedIdx=1 (job 2's index), got %d", m2.selectedIdx)
 	}
 }
+
+func TestTUICalculateColumnWidths(t *testing.T) {
+	// Test that column widths fit within terminal for usable sizes (>= 80)
+	// Narrower terminals may overflow - users should widen their terminal
+	tests := []struct {
+		name           string
+		termWidth      int
+		idWidth        int
+		expectOverflow bool // true if overflow is acceptable for this width
+	}{
+		{
+			name:           "wide terminal",
+			termWidth:      200,
+			idWidth:        3,
+			expectOverflow: false,
+		},
+		{
+			name:           "medium terminal",
+			termWidth:      100,
+			idWidth:        3,
+			expectOverflow: false,
+		},
+		{
+			name:           "standard terminal",
+			termWidth:      80,
+			idWidth:        3,
+			expectOverflow: false,
+		},
+		{
+			name:           "narrow terminal - overflow acceptable",
+			termWidth:      60,
+			idWidth:        3,
+			expectOverflow: true, // Fixed columns alone need ~48 chars
+		},
+		{
+			name:           "very narrow terminal - overflow expected",
+			termWidth:      40,
+			idWidth:        3,
+			expectOverflow: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := tuiModel{width: tt.termWidth}
+			widths := m.calculateColumnWidths(tt.idWidth)
+
+			// All columns must have positive widths
+			if widths.ref < 1 {
+				t.Errorf("ref width %d < 1", widths.ref)
+			}
+			if widths.repo < 1 {
+				t.Errorf("repo width %d < 1", widths.repo)
+			}
+			if widths.agent < 1 {
+				t.Errorf("agent width %d < 1", widths.agent)
+			}
+
+			// Fixed widths: ID (idWidth), Status (10), Queued (12), Elapsed (8), Addr'd (6)
+			// Plus spacing: 2 (prefix) + 7 spaces between columns
+			fixedWidth := 2 + tt.idWidth + 10 + 12 + 8 + 6 + 7
+			flexibleTotal := widths.ref + widths.repo + widths.agent
+			totalWidth := fixedWidth + flexibleTotal
+
+			if !tt.expectOverflow && totalWidth > tt.termWidth {
+				t.Errorf("total width %d exceeds terminal width %d", totalWidth, tt.termWidth)
+			}
+
+			// Even with overflow, flexible columns should be minimal
+			if tt.expectOverflow && flexibleTotal > 15 {
+				t.Errorf("narrow terminal should minimize flexible columns, got %d", flexibleTotal)
+			}
+		})
+	}
+}
+
+func TestTUICalculateColumnWidthsProportions(t *testing.T) {
+	// On wide terminals, columns should use higher minimums
+	m := tuiModel{width: 200}
+	widths := m.calculateColumnWidths(3)
+
+	if widths.ref < 10 {
+		t.Errorf("wide terminal ref width %d < 10", widths.ref)
+	}
+	if widths.repo < 15 {
+		t.Errorf("wide terminal repo width %d < 15", widths.repo)
+	}
+	if widths.agent < 10 {
+		t.Errorf("wide terminal agent width %d < 10", widths.agent)
+	}
+}
+
+func TestTUIRenderJobLineTruncation(t *testing.T) {
+	m := tuiModel{width: 80}
+	// Use a git range - shortRef truncates ranges to 17 chars max, then renderJobLine
+	// truncates further based on colWidths.ref. Use a range longer than 17 chars.
+	job := storage.ReviewJob{
+		ID:         1,
+		GitRef:     "abcdef1234567..ghijkl7890123", // 28 char range, shortRef -> 17 chars
+		RepoName:   "very-long-repository-name-that-exceeds-width",
+		Agent:      "super-long-agent-name",
+		Status:     storage.JobStatusDone,
+		EnqueuedAt: time.Now(),
+	}
+
+	// Use narrow column widths to force truncation
+	// ref=10 will truncate the 17-char shortRef output
+	colWidths := columnWidths{
+		ref:   10,
+		repo:  15,
+		agent: 10,
+	}
+
+	line := m.renderJobLine(job, false, 3, colWidths)
+
+	// Check that truncated values contain "..."
+	if !strings.Contains(line, "...") {
+		t.Errorf("Expected truncation with '...' in line: %s", line)
+	}
+
+	// The line should contain truncated versions, not full strings
+	// shortRef reduces "abcdef1234567..ghijkl7890123" to "abcdef1234567..gh" (17 chars)
+	// then renderJobLine truncates to colWidths.ref (10)
+	if strings.Contains(line, "abcdef1234567..gh") {
+		t.Error("Full git ref (after shortRef) should have been truncated")
+	}
+	if strings.Contains(line, "very-long-repository-name-that-exceeds-width") {
+		t.Error("Full repo name should have been truncated")
+	}
+	if strings.Contains(line, "super-long-agent-name") {
+		t.Error("Full agent name should have been truncated")
+	}
+}
+
+func TestTUIRenderJobLineLength(t *testing.T) {
+	// Test that rendered line length respects column widths
+	m := tuiModel{width: 100}
+	job := storage.ReviewJob{
+		ID:         123,
+		GitRef:     "abc1234..def5678901234567890", // Long range
+		RepoName:   "my-very-long-repository-name-here",
+		Agent:      "claude-code-agent",
+		Status:     storage.JobStatusDone,
+		EnqueuedAt: time.Now(),
+	}
+
+	idWidth := 4
+	colWidths := columnWidths{
+		ref:   12,
+		repo:  15,
+		agent: 10,
+	}
+
+	line := m.renderJobLine(job, false, idWidth, colWidths)
+
+	// Fixed widths: ID (idWidth=4), Status (10), Queued (12), Elapsed (8), Addr'd (varies)
+	// Plus spacing between columns
+	// The line should not be excessively long
+	// Note: line includes ANSI codes for status styling, so we check a reasonable max
+	maxExpectedLen := idWidth + colWidths.ref + colWidths.repo + colWidths.agent + 10 + 12 + 8 + 10 + 20 // generous margin for spacing and ANSI
+	if len(line) > maxExpectedLen {
+		t.Errorf("Line length %d exceeds expected max %d: %s", len(line), maxExpectedLen, line)
+	}
+
+	// Verify truncation happened - original values should not appear
+	if strings.Contains(line, "my-very-long-repository-name-here") {
+		t.Error("Repo name should have been truncated")
+	}
+	if strings.Contains(line, "claude-code-agent") {
+		t.Error("Agent name should have been truncated")
+	}
+}
+
+func TestTUIRenderJobLineNoTruncation(t *testing.T) {
+	m := tuiModel{width: 200}
+	job := storage.ReviewJob{
+		ID:         1,
+		GitRef:     "abc1234",
+		RepoName:   "myrepo",
+		Agent:      "test",
+		Status:     storage.JobStatusDone,
+		EnqueuedAt: time.Now(),
+	}
+
+	// Use wide column widths - no truncation needed
+	colWidths := columnWidths{
+		ref:   20,
+		repo:  20,
+		agent: 15,
+	}
+
+	line := m.renderJobLine(job, false, 3, colWidths)
+
+	// Short values should not be truncated
+	if strings.Contains(line, "...") {
+		t.Errorf("Short values should not be truncated: %s", line)
+	}
+
+	// Original values should appear
+	if !strings.Contains(line, "abc1234") {
+		t.Error("Git ref should appear untruncated")
+	}
+	if !strings.Contains(line, "myrepo") {
+		t.Error("Repo name should appear untruncated")
+	}
+	if !strings.Contains(line, "test") {
+		t.Error("Agent name should appear untruncated")
+	}
+}
