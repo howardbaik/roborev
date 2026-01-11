@@ -207,6 +207,318 @@ func TestIsRebaseInProgress(t *testing.T) {
 	})
 }
 
+func TestGetMainRepoRoot(t *testing.T) {
+	// Create a temp git repo
+	tmpDir := t.TempDir()
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+
+	// Configure git user for commits
+	exec.Command("git", "-C", tmpDir, "config", "user.email", "test@test.com").Run()
+	exec.Command("git", "-C", tmpDir, "config", "user.name", "Test").Run()
+
+	t.Run("regular repo returns same as GetRepoRoot", func(t *testing.T) {
+		mainRoot, err := GetMainRepoRoot(tmpDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot failed: %v", err)
+		}
+
+		repoRoot, err := GetRepoRoot(tmpDir)
+		if err != nil {
+			t.Fatalf("GetRepoRoot failed: %v", err)
+		}
+
+		if mainRoot != repoRoot {
+			t.Errorf("GetMainRepoRoot returned %s, expected %s (same as GetRepoRoot)", mainRoot, repoRoot)
+		}
+	})
+
+	t.Run("worktree returns main repo root", func(t *testing.T) {
+		// Create initial commit so we can create a worktree
+		if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("content"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", tmpDir, "add", ".").Run()
+		exec.Command("git", "-C", tmpDir, "commit", "-m", "initial").Run()
+
+		// Create a worktree
+		worktreeDir := t.TempDir()
+		cmd := exec.Command("git", "-C", tmpDir, "worktree", "add", worktreeDir, "-b", "worktree-branch")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add failed: %v\n%s", err, out)
+		}
+		defer exec.Command("git", "-C", tmpDir, "worktree", "remove", worktreeDir).Run()
+
+		// GetRepoRoot from worktree returns the worktree path
+		worktreeRoot, err := GetRepoRoot(worktreeDir)
+		if err != nil {
+			t.Fatalf("GetRepoRoot on worktree failed: %v", err)
+		}
+
+		// Worktree root should be different from main repo
+		mainRepoRoot, err := GetRepoRoot(tmpDir)
+		if err != nil {
+			t.Fatalf("GetRepoRoot on main repo failed: %v", err)
+		}
+
+		if worktreeRoot == mainRepoRoot {
+			t.Skip("worktree root equals main repo root - older git version")
+		}
+
+		// GetMainRepoRoot from worktree should return the main repo root
+		mainRoot, err := GetMainRepoRoot(worktreeDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on worktree failed: %v", err)
+		}
+
+		if mainRoot != mainRepoRoot {
+			t.Errorf("GetMainRepoRoot on worktree returned %s, expected %s", mainRoot, mainRepoRoot)
+		}
+	})
+
+	t.Run("non-repo returns error", func(t *testing.T) {
+		nonRepo := t.TempDir()
+		_, err := GetMainRepoRoot(nonRepo)
+		if err == nil {
+			t.Error("expected error for non-repo")
+		}
+	})
+
+	t.Run("submodule stays distinct from parent", func(t *testing.T) {
+		// Create parent repo
+		parentDir := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = parentDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init parent failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", parentDir, "config", "user.email", "test@test.com").Run()
+		exec.Command("git", "-C", parentDir, "config", "user.name", "Test").Run()
+		// Allow file:// protocol for submodule clone in test environment
+		exec.Command("git", "-C", parentDir, "config", "protocol.file.allow", "always").Run()
+
+		// Create initial commit in parent
+		if err := os.WriteFile(filepath.Join(parentDir, "parent.txt"), []byte("parent"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", parentDir, "add", ".").Run()
+		exec.Command("git", "-C", parentDir, "commit", "-m", "parent initial").Run()
+
+		// Create a separate repo to use as submodule source
+		subSourceDir := t.TempDir()
+		cmd = exec.Command("git", "init")
+		cmd.Dir = subSourceDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init sub source failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", subSourceDir, "config", "user.email", "test@test.com").Run()
+		exec.Command("git", "-C", subSourceDir, "config", "user.name", "Test").Run()
+		if err := os.WriteFile(filepath.Join(subSourceDir, "sub.txt"), []byte("sub"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", subSourceDir, "add", ".").Run()
+		exec.Command("git", "-C", subSourceDir, "commit", "-m", "sub initial").Run()
+
+		// Add submodule to parent
+		cmd = exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", subSourceDir, "mysub")
+		cmd.Dir = parentDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git submodule add failed: %v\n%s", err, out)
+		}
+
+		submoduleDir := filepath.Join(parentDir, "mysub")
+		// Resolve symlinks for comparison (macOS: /var -> /private/var)
+		submoduleDirResolved, _ := filepath.EvalSymlinks(submoduleDir)
+		if submoduleDirResolved == "" {
+			submoduleDirResolved = submoduleDir
+		}
+
+		// GetMainRepoRoot on submodule should return submodule path, not parent
+		subRoot, err := GetMainRepoRoot(submoduleDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on submodule failed: %v", err)
+		}
+
+		parentRoot, err := GetMainRepoRoot(parentDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on parent failed: %v", err)
+		}
+
+		if subRoot == parentRoot {
+			t.Errorf("submodule root should be distinct from parent: sub=%s parent=%s", subRoot, parentRoot)
+		}
+
+		// Submodule root should be the submodule directory (compare resolved paths)
+		subRootResolved, _ := filepath.EvalSymlinks(subRoot)
+		if subRootResolved == "" {
+			subRootResolved = subRoot
+		}
+		if subRootResolved != submoduleDirResolved {
+			t.Errorf("GetMainRepoRoot on submodule returned %s, expected %s", subRoot, submoduleDir)
+		}
+	})
+
+	t.Run("worktree from submodule returns submodule root", func(t *testing.T) {
+		// This tests the scenario where a worktree is created from within a submodule.
+		// The worktree should resolve to the submodule's root, not the parent repo.
+
+		// Create parent repo
+		parentDir := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = parentDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init parent failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", parentDir, "config", "user.email", "test@test.com").Run()
+		exec.Command("git", "-C", parentDir, "config", "user.name", "Test").Run()
+		exec.Command("git", "-C", parentDir, "config", "protocol.file.allow", "always").Run()
+
+		// Create initial commit in parent
+		if err := os.WriteFile(filepath.Join(parentDir, "parent.txt"), []byte("parent"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", parentDir, "add", ".").Run()
+		exec.Command("git", "-C", parentDir, "commit", "-m", "parent initial").Run()
+
+		// Create a separate repo to use as submodule source
+		subSourceDir := t.TempDir()
+		cmd = exec.Command("git", "init")
+		cmd.Dir = subSourceDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init sub source failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", subSourceDir, "config", "user.email", "test@test.com").Run()
+		exec.Command("git", "-C", subSourceDir, "config", "user.name", "Test").Run()
+		if err := os.WriteFile(filepath.Join(subSourceDir, "sub.txt"), []byte("sub"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", subSourceDir, "add", ".").Run()
+		exec.Command("git", "-C", subSourceDir, "commit", "-m", "sub initial").Run()
+
+		// Add submodule to parent
+		cmd = exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", subSourceDir, "mysub")
+		cmd.Dir = parentDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git submodule add failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", parentDir, "add", ".").Run()
+		exec.Command("git", "-C", parentDir, "commit", "-m", "add submodule").Run()
+
+		submoduleDir := filepath.Join(parentDir, "mysub")
+
+		// Create a worktree from within the submodule
+		worktreeDir := t.TempDir()
+		cmd = exec.Command("git", "worktree", "add", worktreeDir, "-b", "sub-wt-branch")
+		cmd.Dir = submoduleDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add from submodule failed: %v\n%s", err, out)
+		}
+		defer exec.Command("git", "-C", submoduleDir, "worktree", "remove", worktreeDir).Run()
+
+		// GetMainRepoRoot from the submodule's worktree should return the submodule root
+		wtRoot, err := GetMainRepoRoot(worktreeDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on submodule worktree failed: %v", err)
+		}
+
+		// It should match the submodule directory, not parent or .git/modules path
+		subRoot, err := GetMainRepoRoot(submoduleDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on submodule failed: %v", err)
+		}
+
+		if wtRoot != subRoot {
+			t.Errorf("worktree from submodule should return submodule root: wt=%s sub=%s", wtRoot, subRoot)
+		}
+
+		// It should NOT return the parent repo root
+		parentRoot, err := GetMainRepoRoot(parentDir)
+		if err != nil {
+			t.Fatalf("GetMainRepoRoot on parent failed: %v", err)
+		}
+
+		if wtRoot == parentRoot {
+			t.Errorf("worktree from submodule should NOT return parent root: wt=%s parent=%s", wtRoot, parentRoot)
+		}
+
+		// The root should be an actual directory that exists
+		if info, err := os.Stat(wtRoot); err != nil || !info.IsDir() {
+			t.Errorf("GetMainRepoRoot returned invalid path: %s", wtRoot)
+		}
+	})
+
+	t.Run("worktree HEAD resolves to worktree branch", func(t *testing.T) {
+		// Create main repo with initial commit
+		mainDir := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = mainDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init failed: %v\n%s", err, out)
+		}
+		exec.Command("git", "-C", mainDir, "config", "user.email", "test@test.com").Run()
+		exec.Command("git", "-C", mainDir, "config", "user.name", "Test").Run()
+
+		if err := os.WriteFile(filepath.Join(mainDir, "file.txt"), []byte("v1"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", mainDir, "add", ".").Run()
+		exec.Command("git", "-C", mainDir, "commit", "-m", "commit1").Run()
+
+		// Get main branch HEAD
+		mainHead, err := ResolveSHA(mainDir, "HEAD")
+		if err != nil {
+			t.Fatalf("ResolveSHA main HEAD failed: %v", err)
+		}
+
+		// Create worktree on new branch
+		worktreeDir := t.TempDir()
+		cmd = exec.Command("git", "worktree", "add", worktreeDir, "-b", "wt-branch")
+		cmd.Dir = mainDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add failed: %v\n%s", err, out)
+		}
+		defer exec.Command("git", "-C", mainDir, "worktree", "remove", worktreeDir).Run()
+
+		// Make a new commit in the worktree
+		if err := os.WriteFile(filepath.Join(worktreeDir, "file.txt"), []byte("v2"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", worktreeDir, "add", ".").Run()
+		exec.Command("git", "-C", worktreeDir, "commit", "-m", "commit2").Run()
+
+		// Get worktree HEAD
+		wtHead, err := ResolveSHA(worktreeDir, "HEAD")
+		if err != nil {
+			t.Fatalf("ResolveSHA worktree HEAD failed: %v", err)
+		}
+
+		// Worktree HEAD should differ from main HEAD
+		if wtHead == mainHead {
+			t.Error("worktree HEAD should differ from main HEAD after new commit")
+		}
+
+		// Resolving HEAD from main dir should still return main HEAD
+		mainHeadAgain, err := ResolveSHA(mainDir, "HEAD")
+		if err != nil {
+			t.Fatalf("ResolveSHA main HEAD again failed: %v", err)
+		}
+		if mainHeadAgain != mainHead {
+			t.Errorf("main HEAD changed unexpectedly: was %s, now %s", mainHead, mainHeadAgain)
+		}
+
+		// But GetMainRepoRoot should return the same for both
+		mainRoot, _ := GetMainRepoRoot(mainDir)
+		wtRoot, _ := GetMainRepoRoot(worktreeDir)
+		if mainRoot != wtRoot {
+			t.Errorf("GetMainRepoRoot should return same root: main=%s wt=%s", mainRoot, wtRoot)
+		}
+	})
+}
+
 func TestGetBranchName(t *testing.T) {
 	// Create a temp git repo
 	tmpDir := t.TempDir()

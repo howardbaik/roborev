@@ -121,6 +121,68 @@ func GetRepoRoot(path string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// GetMainRepoRoot returns the main repository root, resolving through worktrees.
+// For a regular repository or submodule, this returns the same as GetRepoRoot.
+// For a worktree, this returns the main repository's root path.
+func GetMainRepoRoot(path string) (string, error) {
+	// Get both --git-dir and --git-common-dir to detect worktrees
+	// For regular repos: both return ".git" (or absolute path)
+	// For submodules: both return the same path (e.g., "../.git/modules/sub")
+	// For worktrees: --git-dir returns worktree-specific dir, --git-common-dir returns main repo's .git
+	gitDirCmd := exec.Command("git", "rev-parse", "--git-dir")
+	gitDirCmd.Dir = path
+	gitDirOut, err := gitDirCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-dir: %w", err)
+	}
+	gitDir := strings.TrimSpace(string(gitDirOut))
+
+	commonDirCmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	commonDirCmd.Dir = path
+	commonDirOut, err := commonDirCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-common-dir: %w", err)
+	}
+	commonDir := strings.TrimSpace(string(commonDirOut))
+
+	// Make paths absolute for comparison
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(path, gitDir)
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(path, commonDir)
+	}
+	gitDir = filepath.Clean(gitDir)
+	commonDir = filepath.Clean(commonDir)
+
+	// Only apply worktree resolution if git-dir differs from common-dir
+	// This ensures submodules (where both are the same) use GetRepoRoot
+	if gitDir != commonDir {
+		// This is a worktree. For regular worktrees, commonDir ends with ".git"
+		// and the main repo is its parent. For submodule worktrees, commonDir
+		// is inside .git/modules/ and we need to read the core.worktree config.
+		if filepath.Base(commonDir) == ".git" {
+			// Regular worktree - parent of .git is the repo root
+			return filepath.Dir(commonDir), nil
+		}
+
+		// Submodule worktree - read core.worktree from config
+		cmd := exec.Command("git", "config", "--file", filepath.Join(commonDir, "config"), "core.worktree")
+		out, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("git config core.worktree for submodule worktree: %w", err)
+		}
+		worktree := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(worktree) {
+			worktree = filepath.Join(commonDir, worktree)
+		}
+		return filepath.Clean(worktree), nil
+	}
+
+	// Regular repo or submodule - use standard resolution
+	return GetRepoRoot(path)
+}
+
 // ReadFile reads a file at a specific commit
 func ReadFile(repoPath, sha, filePath string) ([]byte, error) {
 	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", sha, filePath))
