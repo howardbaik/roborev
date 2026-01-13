@@ -109,10 +109,11 @@ func (s *Server) Stop() error {
 // API request/response types
 
 type EnqueueRequest struct {
-	RepoPath  string `json:"repo_path"`
-	CommitSHA string `json:"commit_sha,omitempty"` // Single commit (for backwards compat)
-	GitRef    string `json:"git_ref,omitempty"`    // Single commit or range like "abc..def"
-	Agent     string `json:"agent,omitempty"`
+	RepoPath    string `json:"repo_path"`
+	CommitSHA   string `json:"commit_sha,omitempty"`   // Single commit (for backwards compat)
+	GitRef      string `json:"git_ref,omitempty"`      // Single commit, range like "abc..def", or "dirty"
+	Agent       string `json:"agent,omitempty"`
+	DiffContent string `json:"diff_content,omitempty"` // Pre-captured diff for dirty reviews
 }
 
 type ErrorResponse struct {
@@ -135,8 +136,19 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit request body size to prevent DoS via large payloads
+	// 250KB allows for 200KB diff content plus JSON overhead
+	const maxBodySize = 250 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+
 	var req EnqueueRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Use errors.As for reliable detection of MaxBytesReader errors
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large (max 250KB)")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -189,11 +201,32 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	// Resolve agent (uses main repo root for config lookup)
 	agentName := config.ResolveAgent(req.Agent, repoRoot, s.cfg)
 
-	// Check if this is a range or single commit
-	isRange := strings.Contains(gitRef, "..")
+	// Check if this is a dirty review, range, or single commit
+	isDirty := gitRef == "dirty"
+	isRange := !isDirty && strings.Contains(gitRef, "..")
+
+	// Validate dirty review has diff content
+	if isDirty && req.DiffContent == "" {
+		writeError(w, http.StatusBadRequest, "diff_content required for dirty review")
+		return
+	}
+
+	// Server-side size validation for dirty diffs (200KB max)
+	const maxDiffSize = 200 * 1024
+	if isDirty && len(req.DiffContent) > maxDiffSize {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("diff_content too large (%d bytes, max %d)", len(req.DiffContent), maxDiffSize))
+		return
+	}
 
 	var job *storage.ReviewJob
-	if isRange {
+	if isDirty {
+		// Dirty review - use pre-captured diff
+		job, err = s.db.EnqueueDirtyJob(repo.ID, gitRef, agentName, req.DiffContent)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("enqueue dirty job: %v", err))
+			return
+		}
+	} else if isRange {
 		// For ranges, resolve both endpoints and create range job
 		// Use gitCwd to resolve refs correctly in worktree context
 		parts := strings.SplitN(gitRef, "..", 2)
@@ -255,6 +288,33 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Support fetching a single job by ID
+	if idStr := r.URL.Query().Get("id"); idStr != "" {
+		var jobID int64
+		if _, err := fmt.Sscanf(idStr, "%d", &jobID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id parameter")
+			return
+		}
+		job, err := s.db.GetJobByID(jobID)
+		if err != nil {
+			// Distinguish "not found" from actual DB errors
+			if errors.Is(err, sql.ErrNoRows) {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"jobs":     []storage.ReviewJob{},
+					"has_more": false,
+				})
+				return
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("database error: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"jobs":     []storage.ReviewJob{*job},
+			"has_more": false,
+		})
 		return
 	}
 
