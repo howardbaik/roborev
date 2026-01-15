@@ -16,6 +16,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wesm/roborev/internal/agent"
@@ -114,7 +116,8 @@ func setupRefineRepo(t *testing.T) (string, string) {
 		return ""
 	}
 
-	runGit("init", "-b", "main")
+	runGit("init")
+	runGit("symbolic-ref", "HEAD", "refs/heads/main")
 	runGit("config", "user.email", "test@test.com")
 	runGit("config", "user.name", "Test")
 	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("base"), 0644); err != nil {
@@ -276,7 +279,8 @@ func TestRunRefineSurfacesResponseErrors(t *testing.T) {
 		}
 	}
 
-	runGit("init", "-b", "main")
+	runGit("init")
+	runGit("symbolic-ref", "HEAD", "refs/heads/main")
 	runGit("config", "user.email", "test@test.com")
 	runGit("config", "user.name", "Test")
 	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("base"), 0644); err != nil {
@@ -316,7 +320,7 @@ func TestRunRefineSurfacesResponseErrors(t *testing.T) {
 	}
 	defer os.Chdir(origDir)
 
-	if err := runRefine("test", "", 1, true, false); err == nil {
+	if err := runRefine("test", "", 1, true, false, false, ""); err == nil {
 		t.Fatal("expected error, got nil")
 	}
 }
@@ -345,7 +349,7 @@ func TestRunRefineQuietNonTTYTimerOutput(t *testing.T) {
 	defer func() { isTerminal = origIsTerminal }()
 
 	output := captureStdout(t, func() {
-		if err := runRefine("test", "", 1, true, false); err == nil {
+		if err := runRefine("test", "", 1, true, false, false, ""); err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
@@ -385,7 +389,7 @@ func TestRunRefineStopsLiveTimerOnAgentError(t *testing.T) {
 	defer agent.Register(agent.NewTestAgent())
 
 	output := captureStdout(t, func() {
-		if err := runRefine("test", "", 1, true, false); err == nil {
+		if err := runRefine("test", "", 1, true, false, false, ""); err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
@@ -399,6 +403,69 @@ func TestRunRefineStopsLiveTimerOnAgentError(t *testing.T) {
 	}
 }
 
+// TestRunRefineAgentErrorRetriesWithoutApplyingChanges verifies that when the agent
+// returns an error, the error is properly captured and printed (not shadowed), and
+// the refine loop retries in the next iteration without applying any changes.
+func TestRunRefineAgentErrorRetriesWithoutApplyingChanges(t *testing.T) {
+	repoDir, headSHA := setupRefineRepo(t)
+	state := newMockRefineState()
+	state.reviews[headSHA] = &storage.Review{
+		ID: 1, JobID: 7, Output: "**Bug found**: fail", Addressed: false,
+	}
+
+	_, cleanup := setupMockDaemon(t, createMockRefineHandler(state))
+	defer cleanup()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Use 2 iterations so we can verify retry behavior
+	agent.Register(failingAgent{})
+	defer agent.Register(agent.NewTestAgent())
+
+	// Capture HEAD before running refine
+	headBefore, _ := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+
+	output := captureStdout(t, func() {
+		// With 2 iterations and a failing agent, should exhaust iterations
+		err := runRefine("test", "", 2, true, false, false, "")
+		if err == nil {
+			t.Fatal("expected error after exhausting iterations, got nil")
+		}
+	})
+
+	// Verify agent error message is printed (not shadowed by ResolveSHA)
+	if !strings.Contains(output, "Agent error: test agent failure") {
+		t.Errorf("expected 'Agent error: test agent failure' in output, got: %q", output)
+	}
+
+	// Verify "Will retry in next iteration" message
+	if !strings.Contains(output, "Will retry in next iteration") {
+		t.Errorf("expected 'Will retry in next iteration' in output, got: %q", output)
+	}
+
+	// Verify no commit was created (HEAD unchanged)
+	headAfter, _ := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	if string(headBefore) != string(headAfter) {
+		t.Errorf("expected HEAD to be unchanged after agent error, was %s now %s",
+			strings.TrimSpace(string(headBefore)), strings.TrimSpace(string(headAfter)))
+	}
+
+	// Verify we attempted 2 iterations (both printed)
+	if !strings.Contains(output, "=== Refinement iteration 1/2 ===") {
+		t.Errorf("expected iteration 1/2 in output, got: %q", output)
+	}
+	if !strings.Contains(output, "=== Refinement iteration 2/2 ===") {
+		t.Errorf("expected iteration 2/2 in output, got: %q", output)
+	}
+}
+
 func TestCreateTempWorktreeInitializesSubmodules(t *testing.T) {
 	submoduleRepo := t.TempDir()
 	runSubGit := func(args ...string) {
@@ -409,7 +476,8 @@ func TestCreateTempWorktreeInitializesSubmodules(t *testing.T) {
 		}
 	}
 
-	runSubGit("init", "-b", "main")
+	runSubGit("init")
+	runSubGit("symbolic-ref", "HEAD", "refs/heads/main")
 	runSubGit("config", "user.email", "test@test.com")
 	runSubGit("config", "user.name", "Test")
 	if err := os.WriteFile(filepath.Join(submoduleRepo, "sub.txt"), []byte("sub"), 0644); err != nil {
@@ -427,7 +495,8 @@ func TestCreateTempWorktreeInitializesSubmodules(t *testing.T) {
 		}
 	}
 
-	runMainGit("init", "-b", "main")
+	runMainGit("init")
+	runMainGit("symbolic-ref", "HEAD", "refs/heads/main")
 	runMainGit("config", "user.email", "test@test.com")
 	runMainGit("config", "user.name", "Test")
 	runMainGit("config", "protocol.file.allow", "always")
@@ -451,6 +520,7 @@ func TestCreateTempWorktreeInitializesSubmodules(t *testing.T) {
 
 // mockRefineState tracks state for simulating the full refine loop
 type mockRefineState struct {
+	mu            sync.Mutex
 	reviews       map[string]*storage.Review   // SHA -> review
 	jobs          map[int64]*storage.ReviewJob // jobID -> job
 	responses     map[int64][]storage.Response // jobID -> responses
@@ -486,6 +556,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 			sha := r.URL.Query().Get("sha")
 			jobIDStr := r.URL.Query().Get("job_id")
 
+			state.mu.Lock()
 			var review *storage.Review
 			if sha != "" {
 				review = state.reviews[sha]
@@ -500,21 +571,29 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 					}
 				}
 			}
+			// Copy under lock before encoding
+			var reviewCopy storage.Review
+			if review != nil {
+				reviewCopy = *review
+			}
+			state.mu.Unlock()
 
 			if review == nil {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			json.NewEncoder(w).Encode(review)
+			json.NewEncoder(w).Encode(reviewCopy)
 
 		case r.URL.Path == "/api/responses" && r.Method == "GET":
 			jobIDStr := r.URL.Query().Get("job_id")
 			var jobID int64
 			fmt.Sscanf(jobIDStr, "%d", &jobID)
-			responses := state.responses[jobID]
-			if responses == nil {
-				responses = []storage.Response{}
-			}
+			state.mu.Lock()
+			// Copy slice under lock before encoding
+			origResponses := state.responses[jobID]
+			responses := make([]storage.Response, len(origResponses))
+			copy(responses, origResponses)
+			state.mu.Unlock()
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"responses": responses,
 			})
@@ -526,6 +605,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 				Response  string `json:"response"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
+			state.mu.Lock()
 			state.respondCalled = append(state.respondCalled, struct {
 				jobID     int64
 				responder string
@@ -539,6 +619,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 				Response:  req.Response,
 			}
 			state.responses[req.JobID] = append(state.responses[req.JobID], resp)
+			state.mu.Unlock()
 
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(resp)
@@ -549,6 +630,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 				Addressed bool  `json:"addressed"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
+			state.mu.Lock()
 			if req.Addressed {
 				state.addressedIDs = append(state.addressedIDs, req.ReviewID)
 				// Update the review in state
@@ -559,6 +641,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 					}
 				}
 			}
+			state.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 
 		case r.URL.Path == "/api/enqueue" && r.Method == "POST":
@@ -568,6 +651,7 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 				Agent    string `json:"agent"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
+			state.mu.Lock()
 			state.enqueuedRefs = append(state.enqueuedRefs, req.GitRef)
 
 			job := &storage.ReviewJob{
@@ -578,15 +662,18 @@ func createMockRefineHandler(state *mockRefineState) http.Handler {
 			}
 			state.jobs[job.ID] = job
 			state.nextJobID++
+			state.mu.Unlock()
 
 			w.WriteHeader(http.StatusCreated)
 			json.NewEncoder(w).Encode(job)
 
 		case r.URL.Path == "/api/jobs" && r.Method == "GET":
+			state.mu.Lock()
 			var jobs []storage.ReviewJob
 			for _, job := range state.jobs {
 				jobs = append(jobs, *job)
 			}
+			state.mu.Unlock()
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"jobs":     jobs,
 				"has_more": false,
@@ -1049,7 +1136,7 @@ func TestRefineLoopStaysOnFailedFixChain(t *testing.T) {
 	agent.Register(changer)
 	defer agent.Register(agent.NewTestAgent())
 
-	if err := runRefine("test", "", 2, true, false); err == nil {
+	if err := runRefine("test", "", 2, true, false, false, ""); err == nil {
 		t.Fatal("expected error from reaching max iterations")
 	}
 
@@ -1057,5 +1144,206 @@ func TestRefineLoopStaysOnFailedFixChain(t *testing.T) {
 		if call.jobID == 2 {
 			t.Fatalf("expected to stay on failed fix chain; saw response for newer commit job 2")
 		}
+	}
+}
+
+// TestRefinePendingJobWaitDoesNotConsumeIteration verifies that waiting for a pending
+// (in-progress) job does not consume a refinement iteration. The test runs with
+// maxIterations=1 and a job that starts as Running then transitions to Done with a
+// passing review - if iterations were consumed during the wait, the test would fail.
+func TestRefinePendingJobWaitDoesNotConsumeIteration(t *testing.T) {
+	repoDir := t.TempDir()
+
+	// Create a git repo with a commit on a feature branch
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		} else if len(out) > 0 {
+			return strings.TrimSpace(string(out))
+		}
+		return ""
+	}
+
+	runGit("init")
+	runGit("symbolic-ref", "HEAD", "refs/heads/main")
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "Test")
+
+	if err := os.WriteFile(filepath.Join(repoDir, "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "base.txt")
+	runGit("commit", "-m", "base commit")
+
+	runGit("checkout", "-b", "feature")
+
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("feature"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "feature.txt")
+	runGit("commit", "-m", "feature commit")
+
+	commitSHA := runGit("rev-parse", "HEAD")
+
+	// Track how many times the job has been polled
+	var pollCount int32
+
+	state := newMockRefineState()
+	// Create a job that starts as Running
+	state.jobs[1] = &storage.ReviewJob{
+		ID:       1,
+		GitRef:   commitSHA,
+		Agent:    "test",
+		Status:   storage.JobStatusRunning, // Starts as pending
+		RepoPath: repoDir,
+	}
+	// Passing review (will be returned once job is Done)
+	state.reviews[commitSHA] = &storage.Review{
+		ID: 1, JobID: 1, Output: "No issues found. LGTM!", Addressed: false,
+	}
+	state.nextJobID = 2
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/status":
+			json.NewEncoder(w).Encode(map[string]interface{}{"version": version.Version})
+
+		case r.URL.Path == "/api/review" && r.Method == http.MethodGet:
+			sha := r.URL.Query().Get("sha")
+			jobIDStr := r.URL.Query().Get("job_id")
+
+			state.mu.Lock()
+			var review *storage.Review
+			if sha != "" {
+				review = state.reviews[sha]
+			} else if jobIDStr != "" {
+				var jobID int64
+				fmt.Sscanf(jobIDStr, "%d", &jobID)
+				for _, rev := range state.reviews {
+					if rev.JobID == jobID {
+						review = rev
+						break
+					}
+				}
+			}
+			state.mu.Unlock()
+
+			if review == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			json.NewEncoder(w).Encode(review)
+
+		case r.URL.Path == "/api/review/address" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+
+		case r.URL.Path == "/api/enqueue" && r.Method == http.MethodPost:
+			// Handle branch review enqueue - create a passing branch review
+			var req struct {
+				GitRef string `json:"git_ref"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			state.mu.Lock()
+			branchJobID := state.nextJobID
+			state.nextJobID++
+			state.jobs[branchJobID] = &storage.ReviewJob{
+				ID:       branchJobID,
+				GitRef:   req.GitRef,
+				Agent:    "test",
+				Status:   storage.JobStatusDone,
+				RepoPath: repoDir,
+			}
+			state.reviews[req.GitRef] = &storage.Review{
+				ID: branchJobID + 1000, JobID: branchJobID, Output: "No issues found. Branch looks good!",
+			}
+			jobCopy := *state.jobs[branchJobID]
+			state.mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(jobCopy)
+
+		case r.URL.Path == "/api/jobs" && r.Method == http.MethodGet:
+			q := r.URL.Query()
+			if idStr := q.Get("id"); idStr != "" {
+				var jobID int64
+				fmt.Sscanf(idStr, "%d", &jobID)
+				state.mu.Lock()
+				job, ok := state.jobs[jobID]
+				if !ok {
+					state.mu.Unlock()
+					json.NewEncoder(w).Encode(map[string]interface{}{"jobs": []storage.ReviewJob{}})
+					return
+				}
+				// On first poll, job is still Running; on subsequent polls, transition to Done
+				count := atomic.AddInt32(&pollCount, 1)
+				if count > 1 {
+					job.Status = storage.JobStatusDone
+				}
+				jobCopy := *job
+				state.mu.Unlock()
+				json.NewEncoder(w).Encode(map[string]interface{}{"jobs": []storage.ReviewJob{jobCopy}})
+				return
+			}
+			if gitRef := q.Get("git_ref"); gitRef != "" {
+				state.mu.Lock()
+				var job *storage.ReviewJob
+				for _, j := range state.jobs {
+					if j.GitRef == gitRef {
+						job = j
+						break
+					}
+				}
+				if job != nil {
+					jobCopy := *job
+					state.mu.Unlock()
+					json.NewEncoder(w).Encode(map[string]interface{}{"jobs": []storage.ReviewJob{jobCopy}})
+					return
+				}
+				state.mu.Unlock()
+			}
+
+			state.mu.Lock()
+			var jobs []storage.ReviewJob
+			for _, job := range state.jobs {
+				jobs = append(jobs, *job)
+			}
+			state.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"jobs":     jobs,
+				"has_more": false,
+			})
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	_, cleanup := setupMockDaemon(t, handler)
+	defer cleanup()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Run refine with maxIterations=1. If waiting on the pending job consumed
+	// an iteration, this would fail with "max iterations reached". Since the
+	// pending job transitions to Done with a passing review (and no failed
+	// reviews exist), refine should succeed.
+	err = runRefine("test", "", 1, true, false, false, "")
+
+	// Should succeed - all reviews pass after waiting for the pending one
+	if err != nil {
+		t.Fatalf("expected refine to succeed (pending wait should not consume iteration), got: %v", err)
+	}
+
+	// Verify the job was actually polled multiple times (proving we waited)
+	if atomic.LoadInt32(&pollCount) < 2 {
+		t.Errorf("expected job to be polled at least twice (wait behavior), got %d polls", atomic.LoadInt32(&pollCount))
 	}
 }

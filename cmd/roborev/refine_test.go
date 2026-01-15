@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,7 +26,8 @@ type mockDaemonClient struct {
 	enqueuedReviews  []enqueuedReview
 
 	// Configurable errors for testing error paths
-	markAddressedErr error
+	markAddressedErr   error
+	getReviewBySHAErr  error
 }
 
 type addedResponse struct {
@@ -49,6 +51,9 @@ func newMockDaemonClient() *mockDaemonClient {
 }
 
 func (m *mockDaemonClient) GetReviewBySHA(sha string) (*storage.Review, error) {
+	if m.getReviewBySHAErr != nil {
+		return nil, m.getReviewBySHAErr
+	}
 	review, ok := m.reviews[sha]
 	if !ok {
 		return nil, nil
@@ -99,6 +104,17 @@ func (m *mockDaemonClient) FindJobForCommit(repoPath, sha string) (*storage.Revi
 	return nil, nil
 }
 
+func (m *mockDaemonClient) FindPendingJobForRef(repoPath, gitRef string) (*storage.ReviewJob, error) {
+	for _, job := range m.jobs {
+		if job.GitRef == gitRef {
+			if job.Status == storage.JobStatusQueued || job.Status == storage.JobStatusRunning {
+				return job, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 func (m *mockDaemonClient) GetResponsesForJob(jobID int64) ([]storage.Response, error) {
 	return m.responses[jobID], nil
 }
@@ -126,20 +142,64 @@ func TestSelectRefineAgentCodexFallback(t *testing.T) {
 }
 
 func TestResolveAllowUnsafeAgents(t *testing.T) {
-	cfg := &config.Config{AllowUnsafeAgents: true}
-	if !resolveAllowUnsafeAgents(false, cfg) {
-		t.Fatal("expected config to enable unsafe agents")
+	tests := []struct {
+		name        string
+		flag        bool
+		flagChanged bool
+		cfg         *config.Config
+		expected    bool
+	}{
+		{
+			name:        "config enables, flag not changed - uses config",
+			flag:        false,
+			flagChanged: false,
+			cfg:         &config.Config{AllowUnsafeAgents: true},
+			expected:    true,
+		},
+		{
+			name:        "config disabled, flag not changed - stays disabled",
+			flag:        false,
+			flagChanged: false,
+			cfg:         &config.Config{AllowUnsafeAgents: false},
+			expected:    false,
+		},
+		{
+			name:        "config disabled, flag explicitly enabled - uses flag",
+			flag:        true,
+			flagChanged: true,
+			cfg:         &config.Config{AllowUnsafeAgents: false},
+			expected:    true,
+		},
+		{
+			name:        "config enabled, flag explicitly disabled - uses flag (user override)",
+			flag:        false,
+			flagChanged: true,
+			cfg:         &config.Config{AllowUnsafeAgents: true},
+			expected:    false,
+		},
+		{
+			name:        "nil config, flag not changed - defaults to false",
+			flag:        false,
+			flagChanged: false,
+			cfg:         nil,
+			expected:    false,
+		},
+		{
+			name:        "nil config, flag explicitly enabled - uses flag",
+			flag:        true,
+			flagChanged: true,
+			cfg:         nil,
+			expected:    true,
+		},
 	}
 
-	cfg.AllowUnsafeAgents = false
-	if resolveAllowUnsafeAgents(false, cfg) {
-		t.Fatal("expected unsafe agents to remain disabled")
-	}
-	if !resolveAllowUnsafeAgents(true, cfg) {
-		t.Fatal("expected CLI flag to enable unsafe agents")
-	}
-	if resolveAllowUnsafeAgents(false, nil) {
-		t.Fatal("expected unsafe agents to remain disabled without config")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := resolveAllowUnsafeAgents(tc.flag, tc.flagChanged, tc.cfg)
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
 	}
 }
 
@@ -527,5 +587,392 @@ func TestFindFailedReviewForBranch_MarkAddressedError(t *testing.T) {
 	expectedMsg := "marking review 1 as addressed"
 	if !strings.Contains(err.Error(), expectedMsg) {
 		t.Errorf("error should mention review ID, got: %v", err)
+	}
+}
+
+func TestFindFailedReviewForBranch_GetReviewBySHAError(t *testing.T) {
+	client := newMockDaemonClient()
+
+	// Configure the mock to return an error when fetching reviews
+	client.getReviewBySHAErr = fmt.Errorf("daemon connection failed")
+
+	commits := []string{"commit1", "commit2"}
+
+	found, err := findFailedReviewForBranch(client, commits)
+
+	// Should return an error and not continue processing
+	if err == nil {
+		t.Fatal("expected error when GetReviewBySHA fails, got nil")
+	}
+	if found != nil {
+		t.Errorf("expected nil review when error occurs, got job %d", found.JobID)
+	}
+
+	// Error message should indicate which commit failed
+	if !strings.Contains(err.Error(), "commit1") {
+		t.Errorf("error should mention commit SHA, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fetching review") {
+		t.Errorf("error should mention 'fetching review', got: %v", err)
+	}
+}
+
+func TestFindPendingJobForBranch_FindsRunningJob(t *testing.T) {
+	client := newMockDaemonClient()
+
+	// Jobs: first is done, second is running
+	client.jobs = map[int64]*storage.ReviewJob{
+		100: {ID: 100, GitRef: "commit1", Status: storage.JobStatusDone},
+		200: {ID: 200, GitRef: "commit2", Status: storage.JobStatusRunning},
+	}
+
+	commits := []string{"commit1", "commit2"}
+
+	pending, err := findPendingJobForBranch(client, "/repo", commits)
+	if err != nil {
+		t.Fatalf("findPendingJobForBranch failed: %v", err)
+	}
+
+	if pending == nil {
+		t.Fatal("expected to find a pending job")
+	}
+	if pending.ID != 200 {
+		t.Errorf("expected running job 200, got %d", pending.ID)
+	}
+}
+
+func TestFindPendingJobForBranch_FindsQueuedJob(t *testing.T) {
+	client := newMockDaemonClient()
+
+	// Jobs: first is queued
+	client.jobs = map[int64]*storage.ReviewJob{
+		100: {ID: 100, GitRef: "commit1", Status: storage.JobStatusQueued},
+	}
+
+	commits := []string{"commit1"}
+
+	pending, err := findPendingJobForBranch(client, "/repo", commits)
+	if err != nil {
+		t.Fatalf("findPendingJobForBranch failed: %v", err)
+	}
+
+	if pending == nil {
+		t.Fatal("expected to find a pending job")
+	}
+	if pending.ID != 100 {
+		t.Errorf("expected queued job 100, got %d", pending.ID)
+	}
+}
+
+func TestFindPendingJobForBranch_NoPendingJobs(t *testing.T) {
+	client := newMockDaemonClient()
+
+	// All jobs are done
+	client.jobs = map[int64]*storage.ReviewJob{
+		100: {ID: 100, GitRef: "commit1", Status: storage.JobStatusDone},
+		200: {ID: 200, GitRef: "commit2", Status: storage.JobStatusDone},
+	}
+
+	commits := []string{"commit1", "commit2"}
+
+	pending, err := findPendingJobForBranch(client, "/repo", commits)
+	if err != nil {
+		t.Fatalf("findPendingJobForBranch failed: %v", err)
+	}
+
+	if pending != nil {
+		t.Errorf("expected no pending jobs, got job %d", pending.ID)
+	}
+}
+
+func TestFindPendingJobForBranch_NoJobsForCommits(t *testing.T) {
+	client := newMockDaemonClient()
+	// No jobs in the map
+
+	commits := []string{"unreviewed1", "unreviewed2"}
+
+	pending, err := findPendingJobForBranch(client, "/repo", commits)
+	if err != nil {
+		t.Fatalf("findPendingJobForBranch failed: %v", err)
+	}
+
+	if pending != nil {
+		t.Errorf("expected nil when no jobs exist, got job %d", pending.ID)
+	}
+}
+
+func TestFindPendingJobForBranch_OldestFirst(t *testing.T) {
+	client := newMockDaemonClient()
+
+	// Two running jobs - should return oldest (commit1)
+	client.jobs = map[int64]*storage.ReviewJob{
+		100: {ID: 100, GitRef: "commit1", Status: storage.JobStatusRunning},
+		200: {ID: 200, GitRef: "commit2", Status: storage.JobStatusRunning},
+	}
+
+	commits := []string{"commit1", "commit2"}
+
+	pending, err := findPendingJobForBranch(client, "/repo", commits)
+	if err != nil {
+		t.Fatalf("findPendingJobForBranch failed: %v", err)
+	}
+
+	if pending == nil {
+		t.Fatal("expected to find a pending job")
+	}
+	// Should return oldest pending job (commit1 is first in list)
+	if pending.ID != 100 {
+		t.Errorf("expected oldest pending job 100, got %d", pending.ID)
+	}
+}
+
+// setupTestGitRepo creates a git repo for testing branch/--since behavior.
+// Returns the repo directory, base commit SHA, and a helper to run git commands.
+func setupTestGitRepo(t *testing.T) (repoDir string, baseSHA string, runGit func(args ...string) string) {
+	t.Helper()
+
+	repoDir = t.TempDir()
+	runGit = func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Use git init + symbolic-ref for compatibility with Git < 2.28 (which lacks -b flag)
+	runGit("init")
+	runGit("symbolic-ref", "HEAD", "refs/heads/main")
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "Test")
+
+	if err := os.WriteFile(filepath.Join(repoDir, "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "base.txt")
+	runGit("commit", "-m", "base commit")
+	baseSHA = runGit("rev-parse", "HEAD")
+
+	return repoDir, baseSHA, runGit
+}
+
+func TestValidateRefineContext_RefusesMainBranchWithoutSince(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, _, _ := setupTestGitRepo(t)
+
+	// Stay on main branch (don't create feature branch)
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Validating without --since on main should fail
+	_, _, _, _, err = validateRefineContext("")
+	if err == nil {
+		t.Fatal("expected error when validating on main without --since")
+	}
+	if !strings.Contains(err.Error(), "refusing to refine on main") {
+		t.Errorf("expected 'refusing to refine on main' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--since") {
+		t.Errorf("expected error to mention --since flag, got: %v", err)
+	}
+}
+
+func TestValidateRefineContext_AllowsMainBranchWithSince(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, baseSHA, runGit := setupTestGitRepo(t)
+
+	// Add another commit on main
+	if err := os.WriteFile(filepath.Join(repoDir, "second.txt"), []byte("second"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "second.txt")
+	runGit("commit", "-m", "second commit")
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Validating with --since on main should pass
+	repoPath, currentBranch, _, mergeBase, err := validateRefineContext(baseSHA)
+	if err != nil {
+		t.Fatalf("validation should pass with --since on main, got: %v", err)
+	}
+	if repoPath == "" {
+		t.Error("expected non-empty repoPath")
+	}
+	if currentBranch != "main" {
+		t.Errorf("expected currentBranch=main, got %s", currentBranch)
+	}
+	if mergeBase != baseSHA {
+		t.Errorf("expected mergeBase=%s, got %s", baseSHA, mergeBase)
+	}
+}
+
+func TestValidateRefineContext_SinceWorksOnFeatureBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, baseSHA, runGit := setupTestGitRepo(t)
+
+	// Create feature branch with commits
+	runGit("checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("feature"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "feature.txt")
+	runGit("commit", "-m", "feature commit")
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// --since should work on feature branch
+	repoPath, currentBranch, _, mergeBase, err := validateRefineContext(baseSHA)
+	if err != nil {
+		t.Fatalf("--since should work on feature branch, got: %v", err)
+	}
+	if repoPath == "" {
+		t.Error("expected non-empty repoPath")
+	}
+	if currentBranch != "feature" {
+		t.Errorf("expected currentBranch=feature, got %s", currentBranch)
+	}
+	if mergeBase != baseSHA {
+		t.Errorf("expected mergeBase=%s, got %s", baseSHA, mergeBase)
+	}
+}
+
+func TestValidateRefineContext_InvalidSinceRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, _, _ := setupTestGitRepo(t)
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Invalid --since ref should fail with clear error
+	_, _, _, _, err = validateRefineContext("nonexistent-ref-abc123")
+	if err == nil {
+		t.Fatal("expected error for invalid --since ref")
+	}
+	if !strings.Contains(err.Error(), "cannot resolve --since") {
+		t.Errorf("expected 'cannot resolve --since' error, got: %v", err)
+	}
+}
+
+func TestValidateRefineContext_SinceNotAncestorOfHEAD(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, _, runGit := setupTestGitRepo(t)
+
+	// Create a commit on a separate branch that diverges from main
+	runGit("checkout", "-b", "other-branch")
+	if err := os.WriteFile(filepath.Join(repoDir, "other.txt"), []byte("other"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "other.txt")
+	runGit("commit", "-m", "commit on other branch")
+	otherBranchSHA := runGit("rev-parse", "HEAD")
+
+	// Go back to main and create a different commit
+	runGit("checkout", "main")
+	if err := os.WriteFile(filepath.Join(repoDir, "main2.txt"), []byte("main2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "main2.txt")
+	runGit("commit", "-m", "second commit on main")
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Using --since with a commit from a different branch (not ancestor of HEAD) should fail
+	_, _, _, _, err = validateRefineContext(otherBranchSHA)
+	if err == nil {
+		t.Fatal("expected error when --since is not an ancestor of HEAD")
+	}
+	if !strings.Contains(err.Error(), "not an ancestor of HEAD") {
+		t.Errorf("expected 'not an ancestor of HEAD' error, got: %v", err)
+	}
+}
+
+func TestValidateRefineContext_FeatureBranchWithoutSinceStillWorks(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repoDir, baseSHA, runGit := setupTestGitRepo(t)
+
+	// Create feature branch
+	runGit("checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("feature"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "feature.txt")
+	runGit("commit", "-m", "feature commit")
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	// Feature branch without --since should pass validation (uses merge-base)
+	repoPath, currentBranch, _, mergeBase, err := validateRefineContext("")
+	if err != nil {
+		t.Fatalf("feature branch without --since should work, got: %v", err)
+	}
+	if repoPath == "" {
+		t.Error("expected non-empty repoPath")
+	}
+	if currentBranch != "feature" {
+		t.Errorf("expected currentBranch=feature, got %s", currentBranch)
+	}
+	// mergeBase should be the base commit (merge-base of feature and main)
+	if mergeBase != baseSHA {
+		t.Errorf("expected mergeBase=%s (base commit), got %s", baseSHA, mergeBase)
 	}
 }

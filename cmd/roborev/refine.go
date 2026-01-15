@@ -31,6 +31,7 @@ func refineCmd() *cobra.Command {
 		maxIterations     int
 		quiet             bool
 		allowUnsafeAgents bool
+		since             string
 	)
 
 	cmd := &cobra.Command{
@@ -49,17 +50,22 @@ Prerequisites:
 - Working tree must be clean (no uncommitted changes)
 - Not in the middle of a rebase
 
-The agent will run tests and verify the build before committing.`,
+The agent will run tests and verify the build before committing.
+
+Use --since to specify a starting commit when on the main branch or to
+limit how far back to look for reviews to address.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRefine(agentName, reasoning, maxIterations, quiet, allowUnsafeAgents)
+			unsafeFlagChanged := cmd.Flags().Changed("allow-unsafe-agents")
+			return runRefine(agentName, reasoning, maxIterations, quiet, allowUnsafeAgents, unsafeFlagChanged, since)
 		},
 	}
 
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for addressing findings (default: from config)")
-	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast (default), standard, or thorough")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard (default), or thorough")
 	cmd.Flags().IntVar(&maxIterations, "max-iterations", 10, "maximum refinement iterations")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress agent output, show elapsed time instead")
 	cmd.Flags().BoolVar(&allowUnsafeAgents, "allow-unsafe-agents", false, "allow agents to run without sandboxing")
+	cmd.Flags().StringVar(&since, "since", "", "base commit to refine from (exclusive, like git's .. range)")
 
 	return cmd
 }
@@ -121,54 +127,87 @@ func (t *stepTimer) stopLive() {
 	fmt.Printf("\r%s %s\n", t.prefix, t.elapsed())
 }
 
-func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, allowUnsafeAgents bool) error {
-	// 1. Validate preconditions
-	repoPath, err := git.GetRepoRoot(".")
+// validateRefineContext validates git and branch preconditions for refine.
+// Returns repoPath, currentBranch, defaultBranch, mergeBase, or an error.
+// This validation happens before any daemon interaction.
+func validateRefineContext(since string) (repoPath, currentBranch, defaultBranch, mergeBase string, err error) {
+	repoPath, err = git.GetRepoRoot(".")
 	if err != nil {
-		return fmt.Errorf("not in a git repository: %w", err)
+		return "", "", "", "", fmt.Errorf("not in a git repository: %w", err)
 	}
 
 	if git.IsRebaseInProgress(repoPath) {
-		return fmt.Errorf("rebase in progress - complete or abort it first")
+		return "", "", "", "", fmt.Errorf("rebase in progress - complete or abort it first")
 	}
 
 	if !git.IsWorkingTreeClean(repoPath) {
-		return fmt.Errorf("working tree not clean - commit or stash your changes first")
+		return "", "", "", "", fmt.Errorf("working tree not clean - commit or stash your changes first")
 	}
 
-	// Ensure daemon is running
+	defaultBranch, err = git.GetDefaultBranch(repoPath)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("cannot determine default branch: %w", err)
+	}
+
+	currentBranch = git.GetCurrentBranch(repoPath)
+
+	if since != "" {
+		// Resolve the --since commit to a full SHA
+		mergeBase, err = git.ResolveSHA(repoPath, since)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("cannot resolve --since %q: %w", since, err)
+		}
+		// Verify --since is an ancestor of HEAD (reachable in commit history)
+		isAncestor, err := git.IsAncestor(repoPath, mergeBase, "HEAD")
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("checking --since ancestry: %w", err)
+		}
+		if !isAncestor {
+			return "", "", "", "", fmt.Errorf("--since %q is not an ancestor of HEAD", since)
+		}
+	} else {
+		// Default behavior: use merge-base with default branch
+		if currentBranch == git.LocalBranchName(defaultBranch) {
+			return "", "", "", "", fmt.Errorf("refusing to refine on %s branch without --since flag", git.LocalBranchName(defaultBranch))
+		}
+
+		mergeBase, err = git.GetMergeBase(repoPath, defaultBranch, "HEAD")
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("cannot find merge-base with %s: %w", defaultBranch, err)
+		}
+	}
+
+	return repoPath, currentBranch, defaultBranch, mergeBase, nil
+}
+
+func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, allowUnsafeAgents bool, unsafeFlagChanged bool, since string) error {
+	// 1. Validate git and branch context (before touching daemon)
+	repoPath, currentBranch, defaultBranch, mergeBase, err := validateRefineContext(since)
+	if err != nil {
+		return err
+	}
+
+	// 2. Connect to daemon (only after all validation passes)
 	if err := ensureDaemon(); err != nil {
 		return fmt.Errorf("daemon not running: %w", err)
 	}
 
-	// Create daemon client
 	client, err := daemon.NewHTTPClientFromRuntime()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 
-	// 2. Find branch context
-	defaultBranch, err := git.GetDefaultBranch(repoPath)
-	if err != nil {
-		return fmt.Errorf("cannot determine default branch: %w", err)
+	// Print branch context after successful connection
+	if since != "" {
+		fmt.Printf("Refining commits since %s on branch %q\n", mergeBase[:7], currentBranch)
+	} else {
+		fmt.Printf("Refining branch %q (diverged from %s at %s)\n", currentBranch, defaultBranch, mergeBase[:7])
 	}
-
-	currentBranch := git.GetCurrentBranch(repoPath)
-	if currentBranch == git.LocalBranchName(defaultBranch) {
-		return fmt.Errorf("refusing to refine on %s branch - create a feature branch first", git.LocalBranchName(defaultBranch))
-	}
-
-	mergeBase, err := git.GetMergeBase(repoPath, defaultBranch, "HEAD")
-	if err != nil {
-		return fmt.Errorf("cannot find merge-base with %s: %w", defaultBranch, err)
-	}
-
-	fmt.Printf("Refining branch %q (diverged from %s at %s)\n", currentBranch, defaultBranch, mergeBase[:7])
 
 	// Resolve agent
 	cfg, _ := config.LoadGlobal()
 	resolvedAgent := config.ResolveAgent(agentName, repoPath, cfg)
-	allowUnsafeAgents = resolveAllowUnsafeAgents(allowUnsafeAgents, cfg)
+	allowUnsafeAgents = resolveAllowUnsafeAgents(allowUnsafeAgents, unsafeFlagChanged, cfg)
 	agent.SetAllowUnsafeAgents(allowUnsafeAgents)
 
 	// Resolve reasoning level from CLI or config (default: fast)
@@ -190,9 +229,7 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 	// before moving on to the next oldest failed commit
 	var currentFailedReview *storage.Review
 
-	for iteration := 1; iteration <= maxIterations; iteration++ {
-		fmt.Printf("\n=== Refinement iteration %d/%d ===\n", iteration, maxIterations)
-
+	for iteration := 1; iteration <= maxIterations; {
 		// Get commits on current branch
 		commits, err := git.GetCommitsSince(repoPath, mergeBase)
 		if err != nil {
@@ -214,31 +251,88 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 		}
 
 		if currentFailedReview == nil {
-			// No individual commit failures - run whole-branch review
-			fmt.Println("No individual failed reviews - running branch review...")
-
-			rangeRef := mergeBase + ".." + "HEAD"
-			jobID, err := client.EnqueueReview(repoPath, rangeRef, resolvedAgent)
+			// Check for pending jobs before triggering a branch review
+			pendingJob, err := findPendingJobForBranch(client, repoPath, commits)
 			if err != nil {
-				return fmt.Errorf("failed to enqueue branch review: %w", err)
+				return fmt.Errorf("error checking pending jobs: %w", err)
 			}
+			if pendingJob != nil {
+				// Wait for the pending job to complete, then loop back to check its result
+				// This does NOT consume an iteration - we only count actual fix attempts
+				fmt.Printf("Waiting for in-progress review (job %d)...\n", pendingJob.ID)
+				review, err := client.WaitForReview(pendingJob.ID)
+				if err != nil {
+					fmt.Printf("Warning: review failed: %v\n", err)
+					continue // Loop back, will re-check
+				}
+				verdict := storage.ParseVerdict(review.Output)
+				if verdict == "F" && !review.Addressed {
+					currentFailedReview = review
+				} else if verdict == "P" {
+					if err := client.MarkReviewAddressed(review.ID); err != nil {
+						fmt.Printf("Warning: failed to mark review %d as addressed: %v\n", review.ID, err)
+					}
+					continue // Loop back to check for more
+				}
+				// If we have a failed review now, fall through to address it
+				// Otherwise loop back
+				if currentFailedReview == nil {
+					continue
+				}
+			} else {
+				// No pending commit jobs and no failed reviews - check for branch review
+				// Resolve HEAD to SHA to ensure stable rangeRef (avoids stale results if HEAD moves)
+				headSHA, err := git.ResolveSHA(repoPath, "HEAD")
+				if err != nil {
+					return fmt.Errorf("cannot resolve HEAD: %w", err)
+				}
+				rangeRef := mergeBase + ".." + headSHA
 
-			fmt.Printf("Waiting for branch review (job %d)...\n", jobID)
-			review, err := client.WaitForReview(jobID)
-			if err != nil {
-				return fmt.Errorf("branch review failed: %w", err)
+				// Check if a branch review job already exists (queued or running).
+				// Note: We don't filter by agent here because the --agent flag controls
+				// the ADDRESSING agent (which fixes code), not the REVIEW agent.
+				// We use the SHA-based rangeRef to ensure we only reuse jobs for the
+				// exact same HEAD - if HEAD has moved, we want a fresh review.
+				existingJob, err := client.FindPendingJobForRef(repoPath, rangeRef)
+				if err != nil {
+					return fmt.Errorf("error checking for existing branch review: %w", err)
+				}
+
+				var jobID int64
+				if existingJob != nil {
+					// Wait for existing pending branch review
+					fmt.Printf("Waiting for in-progress branch review (job %d)...\n", existingJob.ID)
+					jobID = existingJob.ID
+				} else {
+					// No pending branch review - enqueue a new one
+					fmt.Println("No individual failed reviews - running branch review...")
+					jobID, err = client.EnqueueReview(repoPath, rangeRef, resolvedAgent)
+					if err != nil {
+						return fmt.Errorf("failed to enqueue branch review: %w", err)
+					}
+					fmt.Printf("Waiting for branch review (job %d)...\n", jobID)
+				}
+
+				review, err := client.WaitForReview(jobID)
+				if err != nil {
+					return fmt.Errorf("branch review failed: %w", err)
+				}
+
+				verdict := storage.ParseVerdict(review.Output)
+				if verdict == "P" {
+					fmt.Println("\nAll reviews passed! Branch is ready.")
+					return nil
+				}
+
+				// Branch review failed - address its findings
+				fmt.Printf("\nBranch review failed. Addressing findings...\n")
+				currentFailedReview = review
 			}
-
-			verdict := storage.ParseVerdict(review.Output)
-			if verdict == "P" {
-				fmt.Println("\nAll reviews passed! Branch is ready.")
-				return nil
-			}
-
-			// Branch review failed - address its findings
-			fmt.Printf("\nBranch review failed. Addressing findings...\n")
-			currentFailedReview = review
 		}
+
+		// Now we have a review to address - this counts as an iteration
+		fmt.Printf("\n=== Refinement iteration %d/%d ===\n", iteration, maxIterations)
+		iteration++
 
 		// Address the failed review
 		liveTimer := quiet && isTerminal(os.Stdout.Fd())
@@ -262,6 +356,13 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 		// Record clean state before agent runs to detect user edits during run
 		wasCleanBeforeAgent := git.IsWorkingTreeClean(repoPath)
 
+		// Capture HEAD SHA and branch to detect concurrent changes (branch switch, pull, etc.)
+		headBeforeAgent, err := git.ResolveSHA(repoPath, "HEAD")
+		if err != nil {
+			return fmt.Errorf("cannot determine HEAD: %w", err)
+		}
+		branchBeforeAgent := git.GetCurrentBranch(repoPath)
+
 		// Create temp worktree to isolate agent work from user's working tree
 		worktreePath, cleanupWorktree, err := createTempWorktree(repoPath)
 		if err != nil {
@@ -280,7 +381,7 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 			timer.startLive(fmt.Sprintf("Addressing review (job %d)...", currentFailedReview.JobID))
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
-		output, err := addressAgent.Review(ctx, worktreePath, "HEAD", addressPrompt, agentOutput)
+		output, agentErr := addressAgent.Review(ctx, worktreePath, "HEAD", addressPrompt, agentOutput)
 		cancel()
 
 		// Show elapsed time
@@ -298,9 +399,22 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 			return fmt.Errorf("working tree changed during refine - aborting to prevent data loss")
 		}
 
-		if err != nil {
+		// Check if HEAD or branch changed during agent run (branch switch, pull, etc.)
+		headAfterAgent, resolveErr := git.ResolveSHA(repoPath, "HEAD")
+		if resolveErr != nil {
 			cleanupWorktree()
-			fmt.Printf("Agent error: %v\n", err)
+			return fmt.Errorf("cannot determine HEAD after agent run: %w", resolveErr)
+		}
+		branchAfterAgent := git.GetCurrentBranch(repoPath)
+		if headAfterAgent != headBeforeAgent || branchAfterAgent != branchBeforeAgent {
+			cleanupWorktree()
+			return fmt.Errorf("HEAD changed during refine (was %s on %s, now %s on %s) - aborting to prevent applying patch to wrong commit",
+				headBeforeAgent[:7], branchBeforeAgent, headAfterAgent[:7], branchAfterAgent)
+		}
+
+		if agentErr != nil {
+			cleanupWorktree()
+			fmt.Printf("Agent error: %v\n", agentErr)
 			fmt.Println("Will retry in next iteration")
 			continue
 		}
@@ -396,11 +510,18 @@ func runRefine(agentName, reasoningStr string, maxIterations int, quiet bool, al
 	return fmt.Errorf("max iterations (%d) reached without all reviews passing", maxIterations)
 }
 
-func resolveAllowUnsafeAgents(flag bool, cfg *config.Config) bool {
+// resolveAllowUnsafeAgents determines whether to allow unsafe agents.
+// Priority: explicit CLI flag > global config > default (false)
+func resolveAllowUnsafeAgents(flag bool, flagChanged bool, cfg *config.Config) bool {
+	// If user explicitly set the flag, honor their choice
+	if flagChanged {
+		return flag
+	}
+	// Otherwise use config (defaults to false)
 	if cfg != nil && cfg.AllowUnsafeAgents {
 		return true
 	}
-	return flag
+	return false
 }
 
 // findFailedReviewForBranch finds an unaddressed failed review for any of the given commits.
@@ -410,7 +531,10 @@ func findFailedReviewForBranch(client daemon.Client, commits []string) (*storage
 	// Iterate oldest to newest (commits are in chronological order)
 	for _, sha := range commits {
 		review, err := client.GetReviewBySHA(sha)
-		if err != nil || review == nil {
+		if err != nil {
+			return nil, fmt.Errorf("fetching review for %s: %w", sha[:7], err)
+		}
+		if review == nil {
 			continue
 		}
 
@@ -432,6 +556,25 @@ func findFailedReviewForBranch(client daemon.Client, commits []string) (*storage
 		}
 	}
 
+	return nil, nil
+}
+
+// findPendingJobForBranch finds a queued or running job for any of the given commits.
+// Returns the first pending job found (oldest commit first), or nil if all jobs are complete.
+func findPendingJobForBranch(client daemon.Client, repoPath string, commits []string) (*storage.ReviewJob, error) {
+	for _, sha := range commits {
+		job, err := client.FindJobForCommit(repoPath, sha)
+		if err != nil {
+			return nil, err
+		}
+		if job == nil {
+			continue
+		}
+		// Check if job is still pending (queued or running)
+		if job.Status == storage.JobStatusQueued || job.Status == storage.JobStatusRunning {
+			return job, nil
+		}
+	}
 	return nil, nil
 }
 

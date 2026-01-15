@@ -38,6 +38,9 @@ type Client interface {
 	// FindJobForCommit finds a job for a specific commit in a repo
 	FindJobForCommit(repoPath, sha string) (*storage.ReviewJob, error)
 
+	// FindPendingJobForRef finds a queued or running job for any git ref
+	FindPendingJobForRef(repoPath, gitRef string) (*storage.ReviewJob, error)
+
 	// GetResponsesForJob fetches responses for a job
 	GetResponsesForJob(jobID int64) ([]storage.Response, error)
 }
@@ -314,6 +317,52 @@ func (c *HTTPClient) FindJobForCommit(repoPath, sha string) (*storage.ReviewJob,
 		}
 		if jobRepo == normalizedRepo {
 			return job, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (c *HTTPClient) FindPendingJobForRef(repoPath, gitRef string) (*storage.ReviewJob, error) {
+	// Normalize repo path to main repo root
+	normalizedRepo := repoPath
+	if mainRoot, err := git.GetMainRepoRoot(repoPath); err == nil {
+		normalizedRepo = mainRoot
+	}
+	if resolved, err := filepath.EvalSymlinks(normalizedRepo); err == nil {
+		normalizedRepo = resolved
+	}
+	if abs, err := filepath.Abs(normalizedRepo); err == nil {
+		normalizedRepo = abs
+	}
+
+	// Use server-side status filtering to find pending jobs.
+	// Query for queued first, then running - this avoids pagination issues.
+	for _, status := range []string{"queued", "running"} {
+		queryURL := fmt.Sprintf("%s/api/jobs?git_ref=%s&repo=%s&status=%s&limit=1",
+			c.addr, url.QueryEscape(gitRef), url.QueryEscape(normalizedRepo), status)
+
+		resp, err := c.httpClient.Get(queryURL)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("query for %s: server returned %s", gitRef, resp.Status)
+		}
+
+		var result struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("query for %s: decode error: %w", gitRef, err)
+		}
+		resp.Body.Close()
+
+		if len(result.Jobs) > 0 {
+			return &result.Jobs[0], nil
 		}
 	}
 
