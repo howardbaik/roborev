@@ -1399,8 +1399,24 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jobs = msg.jobs
 		}
 
-		// Apply any pending addressed changes to prevent flash during race condition
-		// (user pressed 'a' but server response arrived before addressed update completed)
+		// Clear pending addressed states that server has confirmed (data matches pending)
+		// This must happen before re-applying, so we can check the raw server state
+		for jobID, pending := range m.pendingAddressed {
+			for i := range m.jobs {
+				if m.jobs[i].ID == jobID {
+					// Check if server state matches pending state
+					// Treat nil as false (unaddressed) for comparison
+					serverState := m.jobs[i].Addressed != nil && *m.jobs[i].Addressed
+					if serverState == pending.newState {
+						delete(m.pendingAddressed, jobID)
+					}
+					break
+				}
+			}
+		}
+
+		// Apply any remaining pending addressed changes to prevent flash during race
+		// condition (server data is stale, from request sent before update completed)
 		for i := range m.jobs {
 			if pending, ok := m.pendingAddressed[m.jobs[i].ID]; ok {
 				newState := pending.newState
@@ -1557,13 +1573,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Stale error responses are silently ignored
 		} else {
-			// Success: clear pending state if current
-			if isCurrentRequest {
-				if msg.jobID > 0 {
-					delete(m.pendingAddressed, msg.jobID)
-				} else if msg.reviewID > 0 {
-					delete(m.pendingReviewAddressed, msg.reviewID)
-				}
+			// Success handling differs by type:
+			// - For jobs (jobID > 0): don't clear here. Let the jobs refresh handler
+			//   clear it when server data confirms the update. This prevents a race
+			//   where we clear pending, then a stale jobs response arrives and briefly
+			//   shows the old state.
+			// - For review-only (no jobID): clear immediately. The race condition doesn't
+			//   apply because pendingReviewAddressed isn't affected by jobs refresh.
+			if isCurrentRequest && msg.jobID == 0 && msg.reviewID > 0 {
+				delete(m.pendingReviewAddressed, msg.reviewID)
 			}
 		}
 
