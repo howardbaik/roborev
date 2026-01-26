@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -16,11 +17,33 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 	"github.com/roborev-dev/roborev/internal/storage"
+	"github.com/roborev-dev/roborev/internal/version"
 )
+
+// testServerAddr is a placeholder address used in tests that don't make real HTTP calls.
+// Tests that need actual HTTP should use httptest.NewServer and pass ts.URL.
+const testServerAddr = "http://test.invalid:9999"
+
+// setupTuiTestEnv isolates the test from the production roborev environment
+// by setting ROBOREV_DATA_DIR to a temp directory. This prevents tests from
+// reading production daemon.json or affecting production state.
+func setupTuiTestEnv(t *testing.T) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	origDataDir := os.Getenv("ROBOREV_DATA_DIR")
+	os.Setenv("ROBOREV_DATA_DIR", tmpDir)
+	t.Cleanup(func() {
+		if origDataDir != "" {
+			os.Setenv("ROBOREV_DATA_DIR", origDataDir)
+		} else {
+			os.Unsetenv("ROBOREV_DATA_DIR")
+		}
+	})
+}
 
 // mockConnError creates a connection error (url.Error) for testing
 func mockConnError(msg string) error {
-	return &url.Error{Op: "Get", URL: "http://localhost:7373", Err: errors.New(msg)}
+	return &url.Error{Op: "Get", URL: testServerAddr, Err: errors.New(msg)}
 }
 
 // stripANSI removes ANSI escape sequences from a string
@@ -3925,6 +3948,60 @@ func TestTUIRenderReviewViewWithoutModel(t *testing.T) {
 	}
 }
 
+func TestTUIRenderPromptViewWithModel(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewPrompt
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Agent:  "codex",
+		Prompt: "Review this code",
+		Job: &storage.ReviewJob{
+			ID:     1,
+			GitRef: "abc1234",
+			Agent:  "codex",
+			Model:  "o3",
+		},
+	}
+
+	output := m.View()
+
+	// Should contain agent with model in format "(codex: o3)"
+	if !strings.Contains(output, "(codex: o3)") {
+		t.Errorf("Expected Prompt view to contain '(codex: o3)', got:\n%s", output)
+	}
+}
+
+func TestTUIRenderPromptViewWithoutModel(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewPrompt
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Agent:  "codex",
+		Prompt: "Review this code",
+		Job: &storage.ReviewJob{
+			ID:     1,
+			GitRef: "abc1234",
+			Agent:  "codex",
+			Model:  "", // No model set
+		},
+	}
+
+	output := m.View()
+
+	// Should contain just the agent "(codex)" without model
+	if !strings.Contains(output, "(codex)") {
+		t.Errorf("Expected Prompt view to contain '(codex)', got:\n%s", output)
+	}
+	// Should NOT contain the colon separator that would indicate a model
+	if strings.Contains(output, "(codex:") {
+		t.Error("Expected Prompt view NOT to contain '(codex:' when no model is set")
+	}
+}
+
 func TestTUIRenderReviewViewNoBranchForRange(t *testing.T) {
 	m := newTuiModel("http://localhost")
 	m.width = 100
@@ -4029,6 +4106,57 @@ func TestTUIRenderReviewViewVerdictOnLine2(t *testing.T) {
 
 	// Line 3: Content
 	if len(lines) > 3 && !strings.Contains(lines[3], "Line 1") {
+		t.Errorf("Line 3 should contain content 'Line 1', got: %s", lines[3])
+	}
+}
+
+func TestTUIRenderReviewViewAddressedWithoutVerdict(t *testing.T) {
+	// Test that [ADDRESSED] appears on line 2 when no verdict is present
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentReview = &storage.Review{
+		ID:        10,
+		Output:    "Line 1\nLine 2\nLine 3",
+		Addressed: true,
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234",
+			RepoName: "myrepo",
+			Agent:    "codex",
+			Verdict:  nil, // No verdict
+		},
+	}
+
+	output := m.View()
+	lines := strings.Split(output, "\n")
+
+	// Require at least 4 lines: title, location, addressed, content
+	if len(lines) < 4 {
+		t.Fatalf("Expected at least 4 lines, got %d:\n%s", len(lines), output)
+	}
+
+	// Line 0: Title
+	if !strings.Contains(lines[0], "Review") {
+		t.Errorf("Line 0 should contain 'Review', got: %s", lines[0])
+	}
+
+	// Line 1: Location (ref)
+	if !strings.Contains(lines[1], "abc1234") {
+		t.Errorf("Line 1 should contain ref 'abc1234', got: %s", lines[1])
+	}
+
+	// Line 2: [ADDRESSED] (no verdict)
+	if !strings.Contains(lines[2], "[ADDRESSED]") {
+		t.Errorf("Line 2 should contain '[ADDRESSED]', got: %s", lines[2])
+	}
+	if strings.Contains(lines[2], "Verdict") {
+		t.Errorf("Line 2 should not contain 'Verdict' when no verdict is set, got: %s", lines[2])
+	}
+
+	// Line 3: Content
+	if !strings.Contains(lines[3], "Line 1") {
 		t.Errorf("Line 3 should contain content 'Line 1', got: %s", lines[3])
 	}
 }
@@ -4301,15 +4429,15 @@ func TestTUIVisibleLinesCalculationNarrowTerminalWithVerdict(t *testing.T) {
 }
 
 func TestTUIVisibleLinesCalculationLongTitleWraps(t *testing.T) {
-	// Test that long titles correctly wrap and reduce visible lines
+	// Test that long titles and location lines correctly wrap and reduce visible lines
 	// New layout:
 	// - Title: "Review #1 very-long-repository-name-here (claude-code)" = ~54 chars, ceil(54/50) = 2 lines
-	// - Location line: repo + ref + branch = 1 line
+	// - Location line: "very-long-repository-name-here abc1234567890..de on feature/very-long-branch-name" = 81 chars, ceil(81/50) = 2 lines
 	// - Addressed line: 1 line (since Addressed=true)
 	// - Status line: 1 line
 	// - Help: ceil(91/50) = 2 lines
-	// Non-content: 2 + 1 + 1 + 1 + 2 = 7
-	// visibleLines = 12 - 7 = 5
+	// Non-content: 2 + 2 + 1 + 1 + 2 = 8
+	// visibleLines = 12 - 8 = 4
 	m := newTuiModel("http://localhost")
 	m.width = 50
 	m.height = 12
@@ -4338,14 +4466,14 @@ func TestTUIVisibleLinesCalculationLongTitleWraps(t *testing.T) {
 		}
 	}
 
-	expectedContent := 5
+	expectedContent := 4
 	if contentCount != expectedContent {
 		t.Errorf("Expected %d content lines with long wrapping title, got %d", expectedContent, contentCount)
 	}
 
 	// Should show scroll indicator with correct range
-	if !strings.Contains(output, "[1-5 of 20 lines]") {
-		t.Errorf("Expected scroll indicator '[1-5 of 20 lines]', output: %s", output)
+	if !strings.Contains(output, "[1-4 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-4 of 20 lines]', output: %s", output)
 	}
 
 	// Should contain the long repo name and branch
@@ -6134,8 +6262,91 @@ func TestFormatClipboardContent(t *testing.T) {
 	}
 }
 
+func TestTUIVersionMismatchDetection(t *testing.T) {
+	setupTuiTestEnv(t)
+
+	t.Run("detects version mismatch", func(t *testing.T) {
+		m := newTuiModel(testServerAddr)
+
+		// Simulate receiving status with different version
+		status := tuiStatusMsg(storage.DaemonStatus{
+			Version: "different-version",
+		})
+
+		updated, _ := m.Update(status)
+		m2 := updated.(tuiModel)
+
+		if !m2.versionMismatch {
+			t.Error("Expected versionMismatch=true when daemon version differs")
+		}
+		if m2.daemonVersion != "different-version" {
+			t.Errorf("Expected daemonVersion='different-version', got %q", m2.daemonVersion)
+		}
+	})
+
+	t.Run("no mismatch when versions match", func(t *testing.T) {
+		m := newTuiModel(testServerAddr)
+
+		// Simulate receiving status with same version as TUI
+		status := tuiStatusMsg(storage.DaemonStatus{
+			Version: version.Version,
+		})
+
+		updated, _ := m.Update(status)
+		m2 := updated.(tuiModel)
+
+		if m2.versionMismatch {
+			t.Error("Expected versionMismatch=false when versions match")
+		}
+	})
+
+	t.Run("displays error banner in queue view when mismatched", func(t *testing.T) {
+		m := newTuiModel(testServerAddr)
+		m.width = 100
+		m.height = 30
+		m.currentView = tuiViewQueue
+		m.versionMismatch = true
+		m.daemonVersion = "old-version"
+
+		output := m.View()
+
+		if !strings.Contains(output, "VERSION MISMATCH") {
+			t.Error("Expected queue view to show VERSION MISMATCH error")
+		}
+		if !strings.Contains(output, "old-version") {
+			t.Error("Expected error to show daemon version")
+		}
+	})
+
+	t.Run("displays error banner in review view when mismatched", func(t *testing.T) {
+		m := newTuiModel(testServerAddr)
+		m.width = 100
+		m.height = 30
+		m.currentView = tuiViewReview
+		m.versionMismatch = true
+		m.daemonVersion = "old-version"
+		m.currentReview = &storage.Review{
+			ID:     1,
+			Output: "Test review",
+			Job: &storage.ReviewJob{
+				ID:       1,
+				GitRef:   "abc123",
+				RepoName: "test",
+				Agent:    "test",
+			},
+		}
+
+		output := m.View()
+
+		if !strings.Contains(output, "VERSION MISMATCH") {
+			t.Error("Expected review view to show VERSION MISMATCH error")
+		}
+	})
+}
+
 func TestTUIConfigReloadFlash(t *testing.T) {
-	m := newTuiModel("http://localhost:7373")
+	setupTuiTestEnv(t)
+	m := newTuiModel(testServerAddr)
 
 	t.Run("no flash on first status fetch", func(t *testing.T) {
 		// First status fetch with a ConfigReloadCounter should NOT flash
@@ -6160,7 +6371,7 @@ func TestTUIConfigReloadFlash(t *testing.T) {
 
 	t.Run("flash on config reload after first fetch", func(t *testing.T) {
 		// Start with a model that has already fetched status once
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.statusFetchedOnce = true
 		m.lastConfigReloadCounter = 1
 
@@ -6183,7 +6394,7 @@ func TestTUIConfigReloadFlash(t *testing.T) {
 
 	t.Run("flash when ConfigReloadCounter changes from zero to non-zero", func(t *testing.T) {
 		// Model has fetched status once but daemon hadn't reloaded yet
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.statusFetchedOnce = true
 		m.lastConfigReloadCounter = 0 // No reload had occurred
 
@@ -6202,7 +6413,7 @@ func TestTUIConfigReloadFlash(t *testing.T) {
 	})
 
 	t.Run("no flash when ConfigReloadCounter unchanged", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.statusFetchedOnce = true
 		m.lastConfigReloadCounter = 1
 
@@ -6222,8 +6433,9 @@ func TestTUIConfigReloadFlash(t *testing.T) {
 }
 
 func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
+	setupTuiTestEnv(t)
 	t.Run("triggers reconnection after 3 consecutive connection errors", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2 // Already had 2 connection errors
 
 		// Third connection error should trigger reconnection
@@ -6242,7 +6454,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("does not trigger reconnection before 3 errors", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 1 // Only 1 error so far
 
 		updated, cmd := m.Update(tuiJobsErrMsg{err: mockConnError("connection refused")})
@@ -6260,7 +6472,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("does not count application errors for reconnection", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2 // 2 connection errors
 
 		// Application error (404, parse error, etc.) should not increment counter
@@ -6279,7 +6491,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("does not count non-connection errors in jobs fetch", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2
 
 		// Non-connection error (like parse error) should not increment
@@ -6292,7 +6504,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("pagination errors also trigger reconnection", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2
 
 		// Connection error in pagination should trigger reconnection
@@ -6311,7 +6523,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("status/review connection errors trigger reconnection", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2
 
 		// Connection error via tuiErrMsg (from fetchStatus, fetchReview, etc.)
@@ -6330,7 +6542,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("status/review application errors do not trigger reconnection", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 2
 
 		// Application error via tuiErrMsg should not increment
@@ -6349,7 +6561,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("resets error count on successful jobs fetch", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 5
 
 		updated, _ := m.Update(tuiJobsMsg{jobs: []storage.ReviewJob{}, hasMore: false})
@@ -6361,7 +6573,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("resets error count on successful status fetch", func(t *testing.T) {
-		m := newTuiModel("http://localhost:7373")
+		m := newTuiModel(testServerAddr)
 		m.consecutiveErrors = 5
 
 		updated, _ := m.Update(tuiStatusMsg(storage.DaemonStatus{Version: "1.0.0"}))
@@ -6373,7 +6585,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("updates server address on successful reconnection", func(t *testing.T) {
-		m := newTuiModel("http://127.0.0.1:7373")
+		m := newTuiModel(testServerAddr)
 		m.reconnecting = true
 
 		updated, cmd := m.Update(tuiReconnectMsg{newAddr: "http://127.0.0.1:7374", version: "2.0.0"})
@@ -6400,15 +6612,15 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("handles reconnection to same address", func(t *testing.T) {
-		m := newTuiModel("http://127.0.0.1:7373")
+		m := newTuiModel(testServerAddr)
 		m.reconnecting = true
 		m.consecutiveErrors = 3
 
 		// Same address - no change needed
-		updated, cmd := m.Update(tuiReconnectMsg{newAddr: "http://127.0.0.1:7373"})
+		updated, cmd := m.Update(tuiReconnectMsg{newAddr: testServerAddr})
 		m2 := updated.(tuiModel)
 
-		if m2.serverAddr != "http://127.0.0.1:7373" {
+		if m2.serverAddr != testServerAddr {
 			t.Errorf("Expected serverAddr unchanged, got %s", m2.serverAddr)
 		}
 		if m2.reconnecting {
@@ -6421,7 +6633,7 @@ func TestTUIReconnectOnConsecutiveErrors(t *testing.T) {
 	})
 
 	t.Run("handles failed reconnection", func(t *testing.T) {
-		m := newTuiModel("http://127.0.0.1:7373")
+		m := newTuiModel(testServerAddr)
 		m.reconnecting = true
 		m.consecutiveErrors = 3
 

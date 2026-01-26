@@ -125,6 +125,7 @@ type tuiModel struct {
 	err               error
 	updateAvailable   string // Latest version if update available, empty if up to date
 	updateIsDevBuild  bool   // True if running a dev build
+	versionMismatch   bool   // True if daemon version doesn't match TUI version
 
 	// Pagination state
 	hasMore        bool // true if there are more jobs to load
@@ -2223,6 +2224,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consecutiveErrors = 0 // Reset on successful fetch
 		if m.status.Version != "" {
 			m.daemonVersion = m.status.Version
+			// Check for version mismatch between TUI and daemon
+			m.versionMismatch = m.daemonVersion != version.Version
 		}
 		// Show flash notification when config is reloaded
 		// Use counter (not timestamp) to detect reloads that happen within the same second
@@ -2710,6 +2713,13 @@ func (m tuiModel) renderQueueView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
+	// Version mismatch error (persistent, red)
+	if m.versionMismatch {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // Bright red
+		b.WriteString(errorStyle.Render(fmt.Sprintf("VERSION MISMATCH: TUI %s != Daemon %s - restart TUI or daemon", version.Version, m.daemonVersion)))
+		b.WriteString("\x1b[K\n")
+	}
+
 	// Help (two lines)
 	helpLine1 := "↑/↓: navigate | enter: review | y: copy | m: commit msg | q: quit | ?: help"
 	helpLine2 := "f: filter | h: hide addressed | a: toggle addressed | x: cancel"
@@ -2916,6 +2926,7 @@ func (m tuiModel) renderReviewView() string {
 	// Build title string and compute its length for line calculation
 	var title string
 	var titleLen int
+	var locationLineLen int
 	if review.Job != nil {
 		ref := shortJobRef(*review.Job)
 		idStr := fmt.Sprintf("#%d ", review.Job.ID)
@@ -2926,34 +2937,31 @@ func (m tuiModel) renderReviewView() string {
 		}
 		repoStr := m.getDisplayName(review.Job.RepoPath, defaultName)
 
-		// Build agent string, including model if explicitly set
-		agentStr := review.Agent
-		if review.Job.Model != "" {
-			agentStr = fmt.Sprintf("%s: %s", review.Agent, review.Job.Model)
-		}
+		agentStr := formatAgentLabel(review.Agent, review.Job.Model)
 
 		title = fmt.Sprintf("Review %s%s (%s)", idStr, repoStr, agentStr)
-		titleLen = len(title)
+		titleLen = runewidth.StringWidth(title)
 
 		b.WriteString(tuiTitleStyle.Render(title))
 		b.WriteString("\x1b[K") // Clear to end of line
 
 		// Show location line: repo path (or identity/name), git ref, and branch
 		b.WriteString("\n")
-		pathLine := review.Job.RepoPath
-		if pathLine == "" {
+		locationLine := review.Job.RepoPath
+		if locationLine == "" {
 			// No local path - use repo name/identity as fallback
-			pathLine = review.Job.RepoName
+			locationLine = review.Job.RepoName
 		}
-		if pathLine != "" {
-			pathLine += " " + ref
+		if locationLine != "" {
+			locationLine += " " + ref
 		} else {
-			pathLine = ref
+			locationLine = ref
 		}
 		if m.currentBranch != "" {
-			pathLine += " on " + m.currentBranch
+			locationLine += " on " + m.currentBranch
 		}
-		b.WriteString(tuiStatusStyle.Render(pathLine))
+		locationLineLen = runewidth.StringWidth(locationLine)
+		b.WriteString(tuiStatusStyle.Render(locationLine))
 		b.WriteString("\x1b[K") // Clear to end of line
 
 		// Show verdict and addressed status on next line
@@ -3017,11 +3025,17 @@ func (m tuiModel) renderReviewView() string {
 		helpLines = (len(helpText) + m.width - 1) / m.width
 	}
 
-	// headerHeight = title + location line (1) + status line (1) + help + verdict/addressed (0|1)
-	headerHeight := titleLines + 1 + helpLines
+	// Compute location line count (repo path + ref + branch can wrap)
+	locationLines := 0
 	if review.Job != nil {
-		headerHeight++ // Add 1 for location line (repo path + ref + branch)
+		locationLines = 1
+		if m.width > 0 && locationLineLen > m.width {
+			locationLines = (locationLineLen + m.width - 1) / m.width
+		}
 	}
+
+	// headerHeight = title + location line + status line (1) + help + verdict/addressed (0|1)
+	headerHeight := titleLines + locationLines + 1 + helpLines
 	hasVerdict := review.Job != nil && review.Job.Verdict != nil && *review.Job.Verdict != ""
 	if hasVerdict || review.Addressed {
 		headerHeight++ // Add 1 for verdict/addressed line
@@ -3068,6 +3082,13 @@ func (m tuiModel) renderReviewView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear status line
 
+	// Version mismatch error (persistent, red)
+	if m.versionMismatch {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+		b.WriteString(errorStyle.Render(fmt.Sprintf("VERSION MISMATCH: TUI %s != Daemon %s - restart TUI or daemon", version.Version, m.daemonVersion)))
+		b.WriteString("\x1b[K\n")
+	}
+
 	b.WriteString(tuiHelpStyle.Render(helpText))
 	b.WriteString("\x1b[K") // Clear help line
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
@@ -3084,11 +3105,7 @@ func (m tuiModel) renderPromptView() string {
 	review := m.currentReview
 	if review.Job != nil {
 		ref := shortJobRef(*review.Job)
-		// Build agent string, including model if explicitly set
-		agentStr := review.Agent
-		if review.Job.Model != "" {
-			agentStr = fmt.Sprintf("%s: %s", review.Agent, review.Job.Model)
-		}
+		agentStr := formatAgentLabel(review.Agent, review.Job.Model)
 		title := fmt.Sprintf("Prompt: %s (%s)", ref, agentStr)
 		b.WriteString(tuiTitleStyle.Render(title))
 	} else {

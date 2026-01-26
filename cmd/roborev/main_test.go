@@ -1475,11 +1475,13 @@ func TestDaemonRunStartsAndShutdownsCleanly(t *testing.T) {
 	}
 
 	// Create the daemon run command with custom flags
+	// Use a high base port to avoid conflicts with production (7373).
+	// FindAvailablePort will auto-increment if 17373 is busy.
 	cmd := daemonRunCmd()
 	cmd.SetArgs([]string{
 		"--db", dbPath,
 		"--config", configPath,
-		"--addr", "127.0.0.1:0", // Use port 0 to get a free port
+		"--addr", "127.0.0.1:17373",
 	})
 
 	// Run daemon in goroutine
@@ -1510,9 +1512,52 @@ func TestDaemonRunStartsAndShutdownsCleanly(t *testing.T) {
 		// Daemon is still running - good
 	}
 
-	// The daemon is blocking in server.Start(), so we can't easily stop it
-	// without sending a signal. For this unit test, we just verify it started.
-	// A full integration test would require a separate process.
+	// Wait for daemon to be fully started and responsive
+	// The runtime file is written before ListenAndServe, so we need to verify
+	// the HTTP server is actually accepting connections.
+	// Use longer timeout for race detector which adds significant overhead.
+	var info *daemon.RuntimeInfo
+	myPID := os.Getpid()
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		runtimes, err := daemon.ListAllRuntimes()
+		if err == nil {
+			// Find the runtime for OUR daemon (matching our PID), not a stale one
+			for _, rt := range runtimes {
+				if rt.PID == myPID && daemon.IsDaemonAlive(rt.Addr) {
+					info = rt
+					break
+				}
+			}
+			if info != nil {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if info == nil {
+		// Provide more context for debugging CI failures
+		runtimes, _ := daemon.ListAllRuntimes()
+		t.Fatalf("daemon did not create runtime file or is not responding (myPID=%d, found %d runtimes)", myPID, len(runtimes))
+	}
+
+	// The daemon runs in a goroutine within this test process.
+	// Use os.Interrupt to trigger the signal handler.
+	proc, err := os.FindProcess(myPID)
+	if err != nil {
+		t.Fatalf("failed to find own process: %v", err)
+	}
+	if err := proc.Signal(os.Interrupt); err != nil {
+		t.Fatalf("failed to send interrupt signal: %v", err)
+	}
+
+	// Wait for daemon to exit (longer timeout for race detector)
+	select {
+	case <-errCh:
+		// Daemon exited - good
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon did not exit within 10 second timeout")
+	}
 }
 
 // TestDaemonStopNotRunning verifies daemon stop reports when no daemon is running

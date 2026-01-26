@@ -542,7 +542,8 @@ func daemonRunCmd() *cobra.Command {
 				if err := server.Stop(); err != nil {
 					log.Printf("Shutdown error: %v", err)
 				}
-				os.Exit(0)
+				// Note: Don't call os.Exit here - let server.Start() return naturally
+				// after Stop() is called. This allows proper cleanup and testability.
 			}()
 
 			// Start server (blocks until shutdown)
@@ -2350,6 +2351,15 @@ func shortJobRef(job storage.ReviewJob) string {
 		return "run"
 	}
 	return shortRef(job.GitRef)
+}
+
+// formatAgentLabel returns the agent display string, including model if set.
+// Format: "agent" or "agent: model"
+func formatAgentLabel(agent string, model string) string {
+	if model != "" {
+		return fmt.Sprintf("%s: %s", agent, model)
+	}
+	return agent
 }
 
 // generateHookContent creates the post-commit hook script content.
