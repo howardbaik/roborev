@@ -95,6 +95,7 @@ const (
 	tuiViewComment
 	tuiViewCommitMsg
 	tuiViewHelp
+	tuiViewTail
 )
 
 // repoFilterItem represents a repo (or group of repos with same display name) in the filter modal
@@ -178,6 +179,14 @@ type tuiModel struct {
 
 	// Help view state
 	helpFromView tuiView // View to return to after closing help
+
+	// Tail view state
+	tailJobID     int64      // Job being tailed
+	tailLines     []tailLine // Buffer of output lines
+	tailScroll    int        // Scroll position
+	tailStreaming bool       // True if job is still running
+	tailFromView  tuiView    // View to return to
+	tailFollow    bool       // True if auto-scrolling to bottom (follow mode)
 }
 
 // pendingState tracks a pending addressed toggle with sequence number
@@ -185,6 +194,23 @@ type pendingState struct {
 	newState bool
 	seq      uint64
 }
+
+// tailLine represents a single line of agent output in the tail view
+type tailLine struct {
+	timestamp time.Time
+	text      string
+	lineType  string // "text", "tool", "thinking", "error"
+}
+
+// tuiTailOutputMsg delivers output lines from the daemon
+type tuiTailOutputMsg struct {
+	lines   []tailLine
+	hasMore bool // true if job is still running
+	err     error
+}
+
+// tuiTailTickMsg triggers a refresh of the tail output
+type tuiTailTickMsg struct{}
 
 type tuiTickMsg time.Time
 type tuiJobsMsg struct {
@@ -644,6 +670,46 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 			return tuiErrMsg(err)
 		}
 		return tuiPromptMsg(&review)
+	}
+}
+
+func (m tuiModel) fetchTailOutput(jobID int64) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := m.client.Get(fmt.Sprintf("%s/api/job/output?job_id=%d", m.serverAddr, jobID))
+		if err != nil {
+			return tuiTailOutputMsg{err: err}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return tuiTailOutputMsg{err: fmt.Errorf("fetch output: %s", resp.Status)}
+		}
+
+		var result struct {
+			JobID   int64  `json:"job_id"`
+			Status  string `json:"status"`
+			Lines   []struct {
+				TS       string `json:"ts"`
+				Text     string `json:"text"`
+				LineType string `json:"line_type"`
+			} `json:"lines"`
+			HasMore bool `json:"has_more"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return tuiTailOutputMsg{err: err}
+		}
+
+		lines := make([]tailLine, len(result.Lines))
+		for i, l := range result.Lines {
+			ts, err := time.Parse(time.RFC3339Nano, l.TS)
+			if err != nil {
+				// Fallback to current time if timestamp is invalid
+				ts = time.Now()
+			}
+			lines[i] = tailLine{timestamp: ts, text: l.Text, lineType: l.LineType}
+		}
+
+		return tuiTailOutputMsg{lines: lines, hasMore: result.HasMore}
 	}
 }
 
@@ -1355,6 +1421,102 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle tail view
+		if m.currentView == tuiViewTail {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "q":
+				m.currentView = m.tailFromView
+				m.tailStreaming = false
+				return m, nil
+			case "x":
+				// Cancel the job from tail view
+				if m.tailJobID > 0 && m.tailStreaming {
+					for i := range m.jobs {
+						if m.jobs[i].ID == m.tailJobID {
+							job := &m.jobs[i]
+							if job.Status == storage.JobStatusRunning {
+								oldStatus := job.Status
+								oldFinishedAt := job.FinishedAt
+								job.Status = storage.JobStatusCanceled
+								now := time.Now()
+								job.FinishedAt = &now
+								m.tailStreaming = false
+								return m, m.cancelJob(job.ID, oldStatus, oldFinishedAt)
+							}
+							break
+						}
+					}
+				}
+				return m, nil
+			case "up", "k":
+				m.tailFollow = false // Stop auto-scroll when user scrolls up
+				if m.tailScroll > 0 {
+					m.tailScroll--
+				}
+				return m, nil
+			case "down", "j":
+				m.tailScroll++
+				return m, nil
+			case "pgup":
+				m.tailFollow = false // Stop auto-scroll when user scrolls up
+				visibleLines := m.height - 4 // Match renderTailView reservedLines
+				if visibleLines < 1 {
+					visibleLines = 1
+				}
+				m.tailScroll -= visibleLines
+				if m.tailScroll < 0 {
+					m.tailScroll = 0
+				}
+				return m, tea.ClearScreen
+			case "pgdown":
+				visibleLines := m.height - 4 // Match renderTailView reservedLines
+				if visibleLines < 1 {
+					visibleLines = 1
+				}
+				m.tailScroll += visibleLines
+				return m, tea.ClearScreen
+			case "home":
+				m.tailFollow = false // Stop auto-scroll when going to top
+				m.tailScroll = 0
+				return m, nil
+			case "end":
+				m.tailFollow = true // Resume auto-scroll when going to bottom
+				visibleLines := m.height - 4 // Match renderTailView reservedLines
+				if visibleLines < 1 {
+					visibleLines = 1
+				}
+				maxScroll := len(m.tailLines) - visibleLines
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				m.tailScroll = maxScroll
+				return m, nil
+			case "g", "G":
+				// Toggle between top and bottom
+				visibleLines := m.height - 4 // Match renderTailView reservedLines
+				if visibleLines < 1 {
+					visibleLines = 1
+				}
+				maxScroll := len(m.tailLines) - visibleLines
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				if m.tailScroll == 0 {
+					// At top, go to bottom
+					m.tailFollow = true
+					m.tailScroll = maxScroll
+				} else {
+					// Not at top, go to top
+					m.tailFollow = false
+					m.tailScroll = 0
+				}
+				return m, tea.ClearScreen
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.currentView == tuiViewReview {
@@ -1714,6 +1876,26 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "t":
+			// Tail running job output
+			if m.currentView == tuiViewQueue && len(m.jobs) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
+				job := m.jobs[m.selectedIdx]
+				if job.Status == storage.JobStatusRunning {
+					m.tailJobID = job.ID
+					m.tailLines = nil
+					m.tailScroll = 0
+					m.tailStreaming = true
+					m.tailFollow = true // Start in follow mode (auto-scroll)
+					m.tailFromView = tuiViewQueue
+					m.currentView = tuiViewTail
+					return m, tea.Batch(tea.ClearScreen, m.fetchTailOutput(job.ID))
+				} else if job.Status == storage.JobStatusQueued {
+					m.flashMessage = "Job is queued - not yet running"
+					m.flashExpiresAt = time.Now().Add(2 * time.Second)
+					m.flashView = tuiViewQueue
+				}
+			}
+
 		case "f":
 			// Open filter modal
 			if m.currentView == tuiViewQueue {
@@ -1933,6 +2115,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// initial load or user-initiated actions (filter changes, etc.)
 		return m, tea.Batch(m.tick(), m.fetchJobs(), m.fetchStatus())
 
+	case tuiTailTickMsg:
+		// Refresh tail output if still in tail view and streaming
+		if m.currentView == tuiViewTail && m.tailStreaming && m.tailJobID > 0 {
+			return m, m.fetchTailOutput(m.tailJobID)
+		}
+
 	case tuiJobsMsg:
 		m.loadingMore = false
 		if !msg.append {
@@ -2105,6 +2293,39 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentReview = msg
 		m.currentView = tuiViewPrompt
 		m.promptScroll = 0
+
+	case tuiTailOutputMsg:
+		m.consecutiveErrors = 0
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		if m.currentView == tuiViewTail {
+			// Only update lines if we have new content, or if job is still streaming
+			// This preserves the output when job completes (buffer gets closed on server)
+			if len(msg.lines) > 0 || msg.hasMore {
+				m.tailLines = msg.lines
+			}
+			m.tailStreaming = msg.hasMore
+			// Auto-scroll to bottom only if in follow mode
+			if m.tailFollow && len(m.tailLines) > 0 {
+				visibleLines := m.height - 4 // Match renderTailView reservedLines
+				if visibleLines < 1 {
+					visibleLines = 1
+				}
+				maxScroll := len(m.tailLines) - visibleLines
+				if maxScroll < 0 {
+					maxScroll = 0
+				}
+				m.tailScroll = maxScroll
+			}
+			// Continue polling if still streaming
+			if m.tailStreaming {
+				return m, tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+					return tuiTailTickMsg{}
+				})
+			}
+		}
 
 	case tuiAddressedMsg:
 		if m.currentReview != nil {
@@ -2332,6 +2553,9 @@ func (m tuiModel) View() string {
 	}
 	if m.currentView == tuiViewHelp {
 		return m.renderHelpView()
+	}
+	if m.currentView == tuiViewTail {
+		return m.renderTailView()
 	}
 	if m.currentView == tuiViewPrompt && m.currentReview != nil {
 		return m.renderPromptView()
@@ -2883,6 +3107,9 @@ func (m tuiModel) renderReviewView() string {
 func (m tuiModel) renderPromptView() string {
 	var b strings.Builder
 
+	// Clear screen and move cursor to home position to prevent artifacts on scroll
+	b.WriteString("\x1b[2J\x1b[H")
+
 	review := m.currentReview
 	if review.Job != nil {
 		ref := shortJobRef(*review.Job)
@@ -3245,6 +3472,131 @@ func (m tuiModel) renderCommitMsgView() string {
 	return b.String()
 }
 
+func (m tuiModel) renderTailView() string {
+	var b strings.Builder
+
+	// Title with job info
+	var title string
+	for _, job := range m.jobs {
+		if job.ID == m.tailJobID {
+			repoName := m.getDisplayName(job.RepoPath, job.RepoName)
+			shortRef := job.GitRef
+			if len(shortRef) > 7 {
+				shortRef = shortRef[:7]
+			}
+			title = fmt.Sprintf("Tail: %s %s (#%d)", repoName, shortRef, job.ID)
+			break
+		}
+	}
+	if title == "" {
+		title = fmt.Sprintf("Tail: Job #%d", m.tailJobID)
+	}
+	if m.tailStreaming {
+		title += " " + tuiRunningStyle.Render("● live")
+	} else {
+		title += " " + tuiDoneStyle.Render("● complete")
+	}
+	b.WriteString(tuiTitleStyle.Render(title))
+	b.WriteString("\x1b[K\n")
+
+	// Calculate visible area
+	reservedLines := 4 // title + separator + status + help
+	visibleLines := m.height - reservedLines
+	if visibleLines < 1 {
+		visibleLines = 1
+	}
+
+	// Clamp scroll
+	maxScroll := len(m.tailLines) - visibleLines
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	scroll := m.tailScroll
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+
+	// Separator
+	b.WriteString(strings.Repeat("─", m.width))
+	b.WriteString("\x1b[K\n")
+
+	// Render lines
+	linesWritten := 0
+	if len(m.tailLines) == 0 {
+		b.WriteString(tuiStatusStyle.Render("Waiting for output..."))
+		b.WriteString("\x1b[K\n")
+		linesWritten++
+	} else {
+		end := scroll + visibleLines
+		if end > len(m.tailLines) {
+			end = len(m.tailLines)
+		}
+		for i := scroll; i < end; i++ {
+			line := m.tailLines[i]
+			// Format with timestamp
+			ts := line.timestamp.Format("15:04:05")
+
+			// Truncate raw text BEFORE styling to avoid cutting ANSI codes
+			// Account for timestamp prefix (8 chars + 1 space = 9)
+			lineText := line.text
+			maxTextWidth := m.width - 9
+			if maxTextWidth > 3 && runewidth.StringWidth(lineText) > maxTextWidth {
+				lineText = runewidth.Truncate(lineText, maxTextWidth-3, "...")
+			}
+
+			var text string
+			switch line.lineType {
+			case "tool":
+				text = fmt.Sprintf("%s %s", tuiStatusStyle.Render(ts), tuiQueuedStyle.Render(lineText))
+			case "error":
+				text = fmt.Sprintf("%s %s", tuiStatusStyle.Render(ts), tuiFailedStyle.Render(lineText))
+			default:
+				text = fmt.Sprintf("%s %s", tuiStatusStyle.Render(ts), lineText)
+			}
+			b.WriteString(text)
+			b.WriteString("\x1b[K\n")
+			linesWritten++
+		}
+	}
+
+	// Pad remaining lines
+	for linesWritten < visibleLines {
+		b.WriteString("\x1b[K\n")
+		linesWritten++
+	}
+
+	// Status line with position and follow mode
+	var status string
+	if len(m.tailLines) > visibleLines {
+		// Calculate actual displayed range (not including padding)
+		displayEnd := scroll + visibleLines
+		if displayEnd > len(m.tailLines) {
+			displayEnd = len(m.tailLines)
+		}
+		status = fmt.Sprintf("[%d-%d of %d lines]", scroll+1, displayEnd, len(m.tailLines))
+	} else {
+		status = fmt.Sprintf("[%d lines]", len(m.tailLines))
+	}
+	if m.tailFollow {
+		status += " " + tuiRunningStyle.Render("[following]")
+	} else {
+		status += " " + tuiStatusStyle.Render("[paused - G to follow]")
+	}
+	b.WriteString(tuiStatusStyle.Render(status))
+	b.WriteString("\x1b[K\n")
+
+	// Help
+	help := "↑/↓: scroll | g: toggle top/bottom | x: cancel | esc/q: back"
+	b.WriteString(tuiHelpStyle.Render(help))
+	b.WriteString("\x1b[K")
+	b.WriteString("\x1b[J") // Clear to end of screen
+
+	return b.String()
+}
+
 func (m tuiModel) renderHelpView() string {
 	var b strings.Builder
 
@@ -3272,6 +3624,7 @@ func (m tuiModel) renderHelpView() string {
 			keys: []struct{ key, desc string }{
 				{"a", "Mark as addressed"},
 				{"c", "Add comment"},
+				{"t", "Tail running job output"},
 				{"x", "Cancel job"},
 				{"r", "Re-run job"},
 				{"y", "Copy review to clipboard"},
