@@ -205,6 +205,8 @@ func getAgentModel(a Agent) string {
 		return v.Model
 	case *OpenCodeAgent:
 		return v.Model
+	case *CursorAgent:
+		return v.Model
 	default:
 		return ""
 	}
@@ -219,9 +221,10 @@ func TestAgentWithModelPersistence(t *testing.T) {
 	}{
 		{"codex", func() Agent { return NewCodexAgent("") }, "o3", "o3"},
 		{"claude", func() Agent { return NewClaudeAgent("") }, "opus", "opus"},
-		{"gemini", func() Agent { return NewGeminiAgent("") }, "gemini-2.5-pro", "gemini-2.5-pro"},
+		{"gemini", func() Agent { return NewGeminiAgent("") }, "gemini-3-pro-preview", "gemini-3-pro-preview"},
 		{"copilot", func() Agent { return NewCopilotAgent("") }, "gpt-4o", "gpt-4o"},
 		{"opencode", func() Agent { return NewOpenCodeAgent("") }, "anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4"},
+		{"cursor", func() Agent { return NewCursorAgent("") }, "claude-sonnet-4", "claude-sonnet-4"},
 	}
 
 	for _, tt := range tests {
@@ -250,6 +253,39 @@ func TestAgentWithModelPersistence(t *testing.T) {
 			a := tt.newAgent().WithModel(tt.model).WithReasoning(ReasoningFast).WithAgentic(true)
 			if got := getAgentModel(a); got != tt.wantModel {
 				t.Errorf("after chained calls: got model %q, want %q", got, tt.wantModel)
+			}
+		})
+	}
+}
+
+func TestWithModelEmptyPreservesDefault(t *testing.T) {
+	tests := []struct {
+		name         string
+		newAgent     func() Agent
+		defaultModel string
+	}{
+		{"codex", func() Agent { return NewCodexAgent("") }, ""},
+		{"claude", func() Agent { return NewClaudeAgent("") }, ""},
+		{"gemini", func() Agent { return NewGeminiAgent("") }, "gemini-3-pro-preview"},
+		{"copilot", func() Agent { return NewCopilotAgent("") }, ""},
+		{"opencode", func() Agent { return NewOpenCodeAgent("") }, ""},
+		{"cursor", func() Agent { return NewCursorAgent("") }, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := tt.newAgent()
+			b := a.WithModel("")
+			if got := getAgentModel(b); got != tt.defaultModel {
+				t.Errorf("WithModel(\"\") changed model from %q to %q", tt.defaultModel, got)
+			}
+		})
+
+		t.Run(tt.name+"/explicit then empty preserves explicit", func(t *testing.T) {
+			a := tt.newAgent().WithModel("custom-model")
+			b := a.WithModel("")
+			if got := getAgentModel(b); got != "custom-model" {
+				t.Errorf("WithModel(\"\") after WithModel(\"custom-model\"): got %q, want %q", got, "custom-model")
 			}
 		})
 	}
@@ -306,7 +342,7 @@ func TestAgentBuildArgsWithModel(t *testing.T) {
 			buildFn: func(model string) []string {
 				return (&GeminiAgent{Model: model}).buildArgs(false)
 			},
-			flag: "-m", model: "gemini-2.5-pro", wantFlag: true,
+			flag: "-m", model: "gemini-3-pro-preview", wantFlag: true,
 		},
 		{
 			name: "gemini without model",

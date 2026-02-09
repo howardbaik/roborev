@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -3405,11 +3406,26 @@ func TestTUIJobsMsgAppendKeepsLoadingJobs(t *testing.T) {
 	}
 }
 
+func TestTUIHideAddressedDefaultFromConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("hide_addressed_by_default = true\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	m := newTuiModel("http://localhost")
+	if !m.hideAddressed {
+		t.Error("hideAddressed should be true when config sets hide_addressed_by_default = true")
+	}
+}
+
 func TestTUIHideAddressedToggle(t *testing.T) {
 	m := newTuiModel("http://localhost")
 	m.currentView = tuiViewQueue
 
-	// Initial state: hideAddressed is false
+	// Initial state: hideAddressed is false (TestMain isolates from real config)
 	if m.hideAddressed {
 		t.Error("hideAddressed should be false initially")
 	}
@@ -3747,6 +3763,85 @@ func TestTUIHideAddressedDisableNoRefetch(t *testing.T) {
 	// No command should be returned when disabling (no need to refetch)
 	if cmd != nil {
 		t.Error("No command should be returned when disabling hideAddressed")
+	}
+}
+
+func TestTUIHideAddressedMalformedConfigNotOverwritten(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+
+	// Write malformed TOML that LoadGlobal will fail to parse
+	malformed := []byte(`this is not valid toml {{{`)
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, malformed, 0644); err != nil {
+		t.Fatalf("write malformed config: %v", err)
+	}
+
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+
+	// Toggle hide addressed ON
+	m2, _ := pressKey(m, 'h')
+
+	// In-session toggle should still work
+	if !m2.hideAddressed {
+		t.Error("hideAddressed should be true after pressing 'h'")
+	}
+
+	// Malformed config file must not have been overwritten
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(got) != string(malformed) {
+		t.Errorf("malformed config was overwritten:\n  before: %q\n  after:  %q", malformed, got)
+	}
+
+	// Toggle back OFF — still works in-session
+	m3, _ := pressKey(m2, 'h')
+	if m3.hideAddressed {
+		t.Error("hideAddressed should be false after pressing 'h' again")
+	}
+}
+
+func TestTUIHideAddressedValidConfigNotMutated(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("ROBOREV_DATA_DIR", tmpDir)
+
+	// Write a valid config with the hide-addressed default enabled
+	validConfig := []byte("hide_addressed_by_default = true\n")
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, validConfig, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	m := newTuiModel("http://localhost")
+	m.currentView = tuiViewQueue
+
+	// Verify the default was loaded
+	if !m.hideAddressed {
+		t.Fatal("hideAddressed should be true from config")
+	}
+
+	// Toggle hide addressed OFF
+	m2, _ := pressKey(m, 'h')
+	if m2.hideAddressed {
+		t.Error("hideAddressed should be false after pressing 'h'")
+	}
+
+	// Toggle hide addressed back ON
+	m3, _ := pressKey(m2, 'h')
+	if !m3.hideAddressed {
+		t.Error("hideAddressed should be true after pressing 'h' again")
+	}
+
+	// Valid config file must not have been mutated by either toggle
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(got) != string(validConfig) {
+		t.Errorf("valid config was mutated:\n  before: %q\n  after:  %q", validConfig, got)
 	}
 }
 

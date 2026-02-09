@@ -348,6 +348,14 @@ func newTuiModel(serverAddr string) tuiModel {
 	if info, err := daemon.GetAnyRunningDaemon(); err == nil && info.Version != "" {
 		daemonVersion = info.Version
 	}
+
+	// Load hideAddressed preference from config
+	hideAddressed := false
+	if cfg, err := config.LoadGlobal(); err == nil {
+		hideAddressed = cfg.HideAddressedByDefault
+	}
+	// Note: Silently ignore config load errors - TUI should work with defaults
+
 	return tuiModel{
 		serverAddr:             serverAddr,
 		daemonVersion:          daemonVersion,
@@ -356,7 +364,8 @@ func newTuiModel(serverAddr string) tuiModel {
 		currentView:            tuiViewQueue,
 		width:                  80, // sensible defaults until we get WindowSizeMsg
 		height:                 24,
-		loadingJobs:            true,                         // Init() calls fetchJobs, so mark as loading
+		loadingJobs:            true, // Init() calls fetchJobs, so mark as loading
+		hideAddressed:          hideAddressed,
 		displayNames:           make(map[string]string),      // Cache display names to avoid disk reads on render
 		branchNames:            make(map[int64]string),       // Cache derived branch names to avoid git calls on render
 		pendingAddressed:       make(map[int64]pendingState), // Track pending addressed changes (by job ID)
@@ -2296,6 +2305,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Toggle hide addressed
 			if m.currentView == tuiViewQueue {
 				m.hideAddressed = !m.hideAddressed
+
 				// Update selection to first visible job immediately
 				if len(m.jobs) > 0 {
 					if m.selectedIdx < 0 || m.selectedIdx >= len(m.jobs) || !m.isJobVisible(m.jobs[m.selectedIdx]) {
