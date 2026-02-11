@@ -19,6 +19,7 @@ import (
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/config"
@@ -216,6 +217,9 @@ type tuiModel struct {
 	tailStreaming bool       // True if job is still running
 	tailFromView  tuiView    // View to return to
 	tailFollow    bool       // True if auto-scrolling to bottom (follow mode)
+
+	// Glamour markdown render cache (pointer so View's value receiver can update it)
+	mdCache *markdownCache
 }
 
 // pendingState tracks a pending addressed toggle with sequence number
@@ -371,9 +375,13 @@ func newTuiModel(serverAddr string) tuiModel {
 	// Load preferences from config
 	hideAddressed := false
 	autoFilterRepo := false
+	tabWidth := 2
 	if cfg, err := config.LoadGlobal(); err == nil {
 		hideAddressed = cfg.HideAddressedByDefault
 		autoFilterRepo = cfg.AutoFilterRepo
+		if cfg.TabWidth > 0 {
+			tabWidth = cfg.TabWidth
+		}
 	}
 	// Note: Silently ignore config load errors - TUI should work with defaults
 
@@ -403,6 +411,7 @@ func newTuiModel(serverAddr string) tuiModel {
 		branchNames:            make(map[int64]string),       // Cache derived branch names to avoid git calls on render
 		pendingAddressed:       make(map[int64]pendingState), // Track pending addressed changes (by job ID)
 		pendingReviewAddressed: make(map[int64]pendingState), // Track pending addressed changes (by review ID)
+		mdCache:                newMarkdownCache(tabWidth),
 	}
 }
 
@@ -2361,9 +2370,17 @@ func (m tuiModel) renderReviewView() string {
 		}
 	}
 
-	// Wrap text to terminal width minus padding
-	wrapWidth := max(20, min(m.width-4, 200))
-	lines := wrapText(content.String(), wrapWidth)
+	// Render markdown content with glamour (cached), falling back to plain text wrapping.
+	// wrapWidth caps at 100 for readability; maxWidth uses actual terminal width for truncation.
+	maxWidth := max(20, m.width-4)
+	wrapWidth := min(maxWidth, 100)
+	contentStr := content.String()
+	var lines []string
+	if m.mdCache != nil {
+		lines = m.mdCache.getReviewLines(contentStr, wrapWidth, maxWidth, review.ID)
+	} else {
+		lines = sanitizeLines(wrapText(contentStr, wrapWidth))
+	}
 
 	// Compute title line count based on actual title length
 	titleLines := 1
@@ -2403,6 +2420,9 @@ func (m tuiModel) renderReviewView() string {
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
+	if m.mdCache != nil {
+		m.mdCache.lastReviewMaxScroll = maxScroll
+	}
 	start := m.reviewScroll
 	if start > maxScroll {
 		start = maxScroll
@@ -2414,7 +2434,11 @@ func (m tuiModel) renderReviewView() string {
 
 	linesWritten := 0
 	for i := start; i < end; i++ {
-		b.WriteString(lines[i])
+		line := lines[i]
+		if m.width > 0 {
+			line = xansi.Truncate(line, m.width, "")
+		}
+		b.WriteString(line)
 		b.WriteString("\x1b[K\n") // Clear to end of line before newline
 		linesWritten++
 	}
@@ -2472,9 +2496,16 @@ func (m tuiModel) renderPromptView() string {
 		headerLines++
 	}
 
-	// Wrap text to terminal width minus padding
-	wrapWidth := max(20, min(m.width-4, 200))
-	lines := wrapText(review.Prompt, wrapWidth)
+	// Render markdown content with glamour (cached), falling back to plain text wrapping.
+	// wrapWidth caps at 100 for readability; maxWidth uses actual terminal width for truncation.
+	maxWidth := max(20, m.width-4)
+	wrapWidth := min(maxWidth, 100)
+	var lines []string
+	if m.mdCache != nil {
+		lines = m.mdCache.getPromptLines(review.Prompt, wrapWidth, maxWidth, review.ID)
+	} else {
+		lines = sanitizeLines(wrapText(review.Prompt, wrapWidth))
+	}
 
 	// Reserve: title(1) + command(0-1) + scroll indicator(1) + help(1) + margin(1)
 	visibleLines := m.height - 3 - headerLines
@@ -2487,6 +2518,9 @@ func (m tuiModel) renderPromptView() string {
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
+	if m.mdCache != nil {
+		m.mdCache.lastPromptMaxScroll = maxScroll
+	}
 	start := m.promptScroll
 	if start > maxScroll {
 		start = maxScroll
@@ -2498,7 +2532,11 @@ func (m tuiModel) renderPromptView() string {
 
 	linesWritten := 0
 	for i := start; i < end; i++ {
-		b.WriteString(lines[i])
+		line := lines[i]
+		if m.width > 0 {
+			line = xansi.Truncate(line, m.width, "")
+		}
+		b.WriteString(line)
 		b.WriteString("\x1b[K\n") // Clear to end of line before newline
 		linesWritten++
 	}
@@ -2870,7 +2908,7 @@ func (m tuiModel) renderCommitMsgView() string {
 	}
 
 	// Wrap text to terminal width minus padding
-	wrapWidth := max(20, min(m.width-4, 200))
+	wrapWidth := max(20, min(m.width-4, 100))
 	lines := wrapText(m.commitMsgContent, wrapWidth)
 
 	// Reserve: title(1) + scroll indicator(1) + help(1) + margin(1)

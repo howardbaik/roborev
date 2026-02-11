@@ -1,10 +1,16 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/glamour"
+	gansi "github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
+	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
+	"github.com/muesli/termenv"
 	"github.com/roborev-dev/roborev/internal/storage"
 )
 
@@ -129,4 +135,261 @@ func wrapText(text string, width int) []string {
 	}
 
 	return result
+}
+
+// markdownCache caches glamour-rendered lines for review and prompt views.
+// Stored as a pointer in tuiModel so that View() (value receiver) can update
+// the cache and have it persist across bubbletea's model copies.
+//
+// glamourStyle is detected once at creation time (before bubbletea takes over
+// the terminal) to avoid calling termenv.HasDarkBackground() on every render,
+// which blocks for seconds inside bubbletea's raw-mode input loop.
+type markdownCache struct {
+	glamourStyle gansi.StyleConfig // custom style derived from dark/light, detected once at init
+	tabWidth     int               // tab expansion width (default 2)
+
+	reviewLines []string
+	reviewID    int64
+	reviewWidth int
+	reviewText  string // raw input text used to produce reviewLines
+
+	promptLines []string
+	promptID    int64
+	promptWidth int
+	promptText  string // raw input text used to produce promptLines
+
+	// Max scroll positions computed during the last render.
+	// Stored here (in the shared pointer) so key handlers can clamp
+	// scroll values even though View() uses a value receiver.
+	lastReviewMaxScroll int
+	lastPromptMaxScroll int
+}
+
+// newMarkdownCache creates a markdownCache, detecting terminal background
+// color now (before bubbletea enters raw mode and takes over stdin).
+// Builds a custom style with zero margins to avoid extra padding.
+func newMarkdownCache(tabWidth int) *markdownCache {
+	style := styles.LightStyleConfig
+	if termenv.HasDarkBackground() {
+		style = styles.DarkStyleConfig
+	}
+	// Remove document and code block margins that add extra indentation.
+	zeroMargin := uint(0)
+	style.Document.Margin = &zeroMargin
+	style.CodeBlock.Margin = &zeroMargin
+	// Remove inline code prefix/suffix spaces (rendered as visible
+	// colored blocks around `backtick` content).
+	style.Code.Prefix = ""
+	style.Code.Suffix = ""
+	if tabWidth <= 0 {
+		tabWidth = 2
+	} else if tabWidth > 16 {
+		tabWidth = 16
+	}
+	return &markdownCache{glamourStyle: style, tabWidth: tabWidth}
+}
+
+// truncateLongLines normalizes tabs and truncates lines inside fenced code
+// blocks that exceed maxWidth, so glamour won't word-wrap them. Prose lines
+// outside code blocks are left intact for glamour to word-wrap naturally.
+//
+// Fence detection follows CommonMark rules: 0-3 spaces of indentation
+// followed by 3+ backticks or 3+ tildes. A closing fence must use the
+// same character and be at least as long as the opening fence.
+func truncateLongLines(text string, maxWidth int, tabWidth int) string {
+	if maxWidth <= 0 {
+		return text
+	}
+	if tabWidth <= 0 {
+		tabWidth = 2
+	} else if tabWidth > 16 {
+		tabWidth = 16
+	}
+	// Expand tabs to spaces. runewidth counts tabs as width 0 but
+	// terminals expand them to up to 8 columns, causing width mismatch.
+	text = strings.ReplaceAll(text, "\t", strings.Repeat(" ", tabWidth))
+	lines := strings.Split(text, "\n")
+	var fenceChar byte // '`' or '~' for the opening fence
+	var fenceLen int   // length of the opening fence run
+	for i, line := range lines {
+		if fenceLen == 0 {
+			// Not inside a code block — check for opening fence.
+			if ch, n, _ := parseFence(line); n > 0 {
+				fenceChar = ch
+				fenceLen = n
+			}
+			continue
+		}
+		// Inside a code block — check for closing fence.
+		// Closing fences must have whitespace-only trailing content.
+		if ch, n, wsOnly := parseFence(line); n >= fenceLen && ch == fenceChar && wsOnly {
+			fenceLen = 0
+			continue
+		}
+		if runewidth.StringWidth(line) > maxWidth {
+			lines[i] = runewidth.Truncate(line, maxWidth, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// parseFence checks if line is a CommonMark fenced code block delimiter.
+// Returns the fence character ('`' or '~'), the run length, and whether
+// trailing content is whitespace-only (required for closing fences).
+// Returns (0, 0, false) if the line is not a valid fence.
+// Allows 0-3 leading spaces.
+func parseFence(line string) (byte, int, bool) {
+	// Strip up to 3 leading spaces.
+	indent := 0
+	for indent < 3 && indent < len(line) && line[indent] == ' ' {
+		indent++
+	}
+	rest := line[indent:]
+	if len(rest) < 3 {
+		return 0, 0, false
+	}
+	ch := rest[0]
+	if ch != '`' && ch != '~' {
+		return 0, 0, false
+	}
+	n := 0
+	for n < len(rest) && rest[n] == ch {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, false
+	}
+	trailing := rest[n:]
+	wsOnly := strings.TrimSpace(trailing) == ""
+	// Backtick fences can't have backticks in the info string.
+	if ch == '`' && strings.ContainsRune(trailing, '`') {
+		return 0, 0, false
+	}
+	return ch, n, wsOnly
+}
+
+// nonCSIEscRe matches non-CSI escape sequences: OSC, DCS, and bare ESC.
+var nonCSIEscRe = regexp.MustCompile(
+	// OSC: ESC ] ... (terminated by BEL or ST)
+	`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?` +
+		`|` +
+		// DCS: ESC P ... ST
+		`\x1bP[^\x1b]*(?:\x1b\\)?` +
+		`|` +
+		// Bare ESC followed by single char (e.g. ESC c for RIS)
+		`\x1b[^[\]P]`,
+)
+
+// csiRe matches all well-formed CSI sequences per ECMA-48:
+// ESC [ <parameter bytes 0x30-0x3F>* <intermediate bytes 0x20-0x2F>* <final byte 0x40-0x7E>
+var csiRe = regexp.MustCompile(`\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]`)
+
+// sgrRe matches SGR (Select Graphic Rendition) sequences specifically:
+// ESC [ <digits and semicolons only> m
+var sgrRe = regexp.MustCompile(`^\x1b\[[0-9;]*m$`)
+
+// sanitizeEscapes strips non-SGR terminal escape sequences and dangerous C0
+// control characters from a line, preventing untrusted content from injecting
+// OSC/CSI/DCS control codes or spoofing output via \r/\b overwrites.
+// SGR sequences (colors/styles), tabs, and newlines are preserved.
+func sanitizeEscapes(line string) string {
+	line = nonCSIEscRe.ReplaceAllString(line, "")
+	line = csiRe.ReplaceAllStringFunc(line, func(seq string) string {
+		if sgrRe.MatchString(seq) {
+			return seq
+		}
+		return ""
+	})
+	// Strip C0 control characters (0x00-0x1F) except tab (0x09), newline
+	// (0x0A), and ESC (0x1B, already handled above). Characters like \r
+	// and \b can overwrite displayed content, enabling output spoofing.
+	var b strings.Builder
+	for _, r := range line {
+		if r < 0x20 && r != '\t' && r != '\n' && r != 0x1b {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// sanitizeLines applies sanitizeEscapes to every line in the slice.
+func sanitizeLines(lines []string) []string {
+	for i, line := range lines {
+		lines[i] = sanitizeEscapes(line)
+	}
+	return lines
+}
+
+// trailingPadRe matches trailing whitespace and ANSI SGR sequences.
+// Glamour pads code block lines with spaces (using background color) to fill
+// the wrap width. Stripping this padding prevents overflow on narrow terminals.
+var trailingPadRe = regexp.MustCompile(`(\s|\x1b\[[0-9;]*m)+$`)
+
+// stripTrailingPadding removes trailing whitespace and ANSI SGR codes from a
+// glamour output line, then appends a reset to ensure clean color state.
+func stripTrailingPadding(line string) string {
+	return trailingPadRe.ReplaceAllString(line, "") + "\x1b[0m"
+}
+
+// renderMarkdownLines renders markdown text using glamour and splits into lines.
+// wrapWidth controls glamour's word-wrap column (capped for readability).
+// maxWidth controls line truncation (actual terminal width).
+// Falls back to wrapText if glamour rendering fails.
+func renderMarkdownLines(text string, wrapWidth, maxWidth int, glamourStyle gansi.StyleConfig, tabWidth int) []string {
+	// Truncate long lines before glamour so they don't get word-wrapped.
+	// Use maxWidth (terminal width) so content fills the available space.
+	text = truncateLongLines(text, maxWidth, tabWidth)
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStyles(glamourStyle),
+		glamour.WithWordWrap(wrapWidth),
+		glamour.WithPreservedNewLines(),
+	)
+	if err != nil {
+		return sanitizeLines(wrapText(text, wrapWidth))
+	}
+	out, err := r.Render(text)
+	if err != nil {
+		return sanitizeLines(wrapText(text, wrapWidth))
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	for i, line := range lines {
+		line = stripTrailingPadding(line)
+		line = sanitizeEscapes(line)
+		// Truncate output lines that still exceed maxWidth (glamour can add
+		// indentation for block quotes, lists, etc. beyond the wrap width).
+		if xansi.StringWidth(line) > maxWidth {
+			line = xansi.Truncate(line, maxWidth, "")
+		}
+		lines[i] = line
+	}
+	return lines
+}
+
+// getReviewLines returns glamour-rendered lines for a review, using the cache
+// when the inputs (review ID, width, text) haven't changed.
+// wrapWidth is the glamour word-wrap column; maxWidth is the truncation limit.
+func (c *markdownCache) getReviewLines(text string, wrapWidth, maxWidth int, reviewID int64) []string {
+	if c.reviewID == reviewID && c.reviewWidth == maxWidth && c.reviewText == text {
+		return c.reviewLines
+	}
+	c.reviewLines = renderMarkdownLines(text, wrapWidth, maxWidth, c.glamourStyle, c.tabWidth)
+	c.reviewID = reviewID
+	c.reviewWidth = maxWidth
+	c.reviewText = text
+	return c.reviewLines
+}
+
+// getPromptLines returns glamour-rendered lines for a prompt, using the cache
+// when the inputs (review ID, width, text) haven't changed.
+// wrapWidth is the glamour word-wrap column; maxWidth is the truncation limit.
+func (c *markdownCache) getPromptLines(text string, wrapWidth, maxWidth int, reviewID int64) []string {
+	if c.promptID == reviewID && c.promptWidth == maxWidth && c.promptText == text {
+		return c.promptLines
+	}
+	c.promptLines = renderMarkdownLines(text, wrapWidth, maxWidth, c.glamourStyle, c.tabWidth)
+	c.promptID = reviewID
+	c.promptWidth = maxWidth
+	c.promptText = text
+	return c.promptLines
 }
